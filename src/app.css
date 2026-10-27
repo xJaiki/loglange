@@ -1,0 +1,144 @@
+@import "tailwindcss";
+
+@theme {
+  /* Surfaces (Warm Obsidian & Tactile Carbon scale) */
+  --color-canvas: #0B0D13;
+  --color-surface: #12151E;
+  --color-surface-elevated: #181C28;
+  --color-surface-hover: #1F2433;
+  --color-border-subtle: rgba(255, 255, 255, 0.09);
+  --color-border-strong: rgba(255, 255, 255, 0.16);
+
+  /* Legacy aliases per retrocompatibilità nei componenti */
+  --color-dark-bg: #0B0D13;
+  --color-dark-elevated: #12151E;
+  --color-dark-border: #1F2433;
+  --color-dark-text: #F4F6FB;
+  --color-dark-muted: #A0A8B8;
+
+  /* Text Hierarchy — High-contrast & optically balanced for dark surfaces */
+  --color-text-primary: #F4F6FB;
+  --color-text-secondary: #B4BCD0;
+  --color-text-muted: #7E879B;
+
+  /* Brand & Accent (Luminous Indigo & Warm Amber) */
+  --color-accent: #6366F1;
+  --color-accent-hover: #818CF8;
+
+  /* Semantic Log Levels */
+  --color-log-error: #FB7185;
+  --color-log-warn: #FBBF24;
+  --color-log-info: #38BDF8;
+  --color-log-debug: #94A3B8;
+  --color-log-trace: #C084FC;
+
+  /* Typography */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* Easing curves */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+:root {
+  color-scheme: dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--color-canvas);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  overflow: hidden;
+  user-select: none;
+}
+
+/* Tabular numbers & crisp ligatures for log data */
+.font-mono {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" on, "zero" on, "calt" on;
+}
+
+/* Custom Text Selection */
+::selection {
+  background-color: rgba(99, 102, 241, 0.32);
+  color: #FFFFFF;
+}
+
+/* Tactile Glass & Surface Utilities (Fixes jagged/un-antialiased borders on Linux WebKit) */
+.tactile-surface {
+  background: linear-gradient(180deg, rgba(28, 33, 47, 0.85) 0%, rgba(18, 21, 30, 0.95) 100%);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.11),
+    0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 4px 12px -2px rgba(0, 0, 0, 0.45);
+}
+
+.tactile-button {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07) 0%, rgba(255, 255, 255, 0.03) 100%);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.1),
+    0 0 0 1px rgba(255, 255, 255, 0.09),
+    0 1px 2px 0 rgba(0, 0, 0, 0.35);
+  transition:
+    transform 140ms var(--ease-out-expo),
+    background-color 140ms var(--ease-out-expo),
+    box-shadow 140ms var(--ease-out-expo),
+    color 140ms var(--ease-out-expo);
+}
+
+.tactile-button:hover {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.11) 0%, rgba(255, 255, 255, 0.05) 100%);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
+    0 0 0 1px rgba(255, 255, 255, 0.14),
+    0 3px 8px -1px rgba(0, 0, 0, 0.45);
+}
+
+.tactile-button:active {
+  transform: scale(0.97);
+}
+
+.tactile-kbd {
+  background: linear-gradient(180deg, #1A1E2B 0%, #11141D 100%);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.12),
+    0 0 0 1px rgba(255, 255, 255, 0.1),
+    0 1.5px 0 0 #07080C;
+  font-family: var(--font-mono);
+}
+
+/* Scrollbar custom sottile ed elegante per VirtualList e Drawer */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.28);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
