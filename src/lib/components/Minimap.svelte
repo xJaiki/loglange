@@ -54,10 +54,13 @@
       ctx.fillStyle = "#818CF8"; // Indigo brillante for matches
       const tickH = 1.5;
 
+      let lastY = -1;
       for (let i = 0; i < matchLines.length; i++) {
         const lineNum = matchLines[i];
-        const y = (lineNum / totalLines) * height;
-        ctx.fillRect(1, Math.floor(y), width - 2, tickH);
+        const y = Math.floor((lineNum / totalLines) * height);
+        if (y === lastY) continue;
+        lastY = y;
+        ctx.fillRect(1, y, width - 2, tickH);
       }
     }
   }

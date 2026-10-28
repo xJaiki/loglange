@@ -3,6 +3,7 @@
   import type { LogLine } from "$lib/types";
   import Minimap from "$lib/components/Minimap.svelte";
   import { tokenizeLogLine } from "$lib/utils/tokenizer";
+  import { logLevelsManager, type StandardLogLevel } from "$lib/stores/logLevels.svelte";
 
   interface Props {
     totalLines: number;
@@ -17,6 +18,8 @@
     onUserScrollUp?: () => void;
     onUserScrollBottom?: () => void;
     onSelectionPause?: () => void;
+    onOpenLogLevels?: () => void;
+    onQuickMapLevel?: (word: string, level: StandardLogLevel) => void;
     searchQuery?: string;
     isRegex?: boolean;
     caseSensitive?: boolean;
@@ -41,6 +44,8 @@
     onUserScrollUp,
     onUserScrollBottom,
     onSelectionPause,
+    onOpenLogLevels,
+    onQuickMapLevel,
     searchQuery = "",
     isRegex = false,
     caseSensitive = false,
@@ -143,6 +148,14 @@
   let endIndex = $derived(Math.min(totalLines, visibleStartIndex + visibleCount + buffer));
   let renderedCount = $derived(Math.max(0, endIndex - startIndex));
 
+  let visibleRowIndices = $derived.by(() => {
+    const arr = new Array(renderedCount);
+    for (let i = 0; i < renderedCount; i++) {
+      arr[i] = startIndex + i;
+    }
+    return arr;
+  });
+
   let totalContentHeight = $derived(totalLines * itemHeight);
   let startOffsetY = $derived(startIndex * itemHeight);
 
@@ -151,7 +164,10 @@
     Math.max(48, `${totalLines}`.length * 9.5 + 24)
   );
 
-  // Request visible slice from Rust backend
+  // Pending fetch tracking to avoid redundant concurrent IPC requests
+  let pendingFetchRange: { start: number; end: number } | null = null;
+
+  // Request visible slice from Rust backend with chunk-alignment
   $effect(() => {
     const start = startIndex;
     const count = renderedCount;
@@ -166,31 +182,56 @@
       }
     }
 
-    if (missing) {
-      const fetchStart = start;
-      const fetchCount = count;
-      fetchSlice(fetchStart, fetchCount).then((newLines) => {
-        if (!newLines || newLines.length === 0) return;
-        const nextMap = new Map(linesMap);
-        for (let i = 0; i < newLines.length; i++) {
-          nextMap.set(fetchStart + i, newLines[i]);
-        }
+    if (!missing) return;
 
-        // Limit cache size to 15000 entries to prevent memory bloat
-        if (nextMap.size > 15000) {
-          const keys = Array.from(nextMap.keys());
-          keys.sort((a, b) => Math.abs(b - start) - Math.abs(a - start));
-          const evictCount = Math.min(3000, nextMap.size - 10000);
-          for (let i = 0; i < evictCount; i++) {
-            nextMap.delete(keys[i]);
+    // If a request covering this range is already in flight, skip duplicate IPC
+    if (
+      pendingFetchRange &&
+      pendingFetchRange.start <= start &&
+      pendingFetchRange.end >= start + count
+    ) {
+      return;
+    }
+
+    // Align request to blocks of 64 lines for high cache efficiency
+    const CHUNK_ALIGN = 64;
+    const fetchStart = Math.max(0, Math.floor((start - 16) / CHUNK_ALIGN) * CHUNK_ALIGN);
+    const fetchEnd = Math.min(
+      totalLines,
+      Math.ceil((start + count + 16) / CHUNK_ALIGN) * CHUNK_ALIGN
+    );
+    const fetchCount = fetchEnd - fetchStart;
+
+    pendingFetchRange = { start: fetchStart, end: fetchEnd };
+
+    fetchSlice(fetchStart, fetchCount).then((newLines) => {
+      if (!newLines || newLines.length === 0) {
+        pendingFetchRange = null;
+        return;
+      }
+      const nextMap = new Map(linesMap);
+      for (let i = 0; i < newLines.length; i++) {
+        nextMap.set(fetchStart + i, newLines[i]);
+      }
+
+      // Bounded cache: keep up to 3500 entries centered around active viewport
+      // Fast O(N) window pruning without costly keys.sort()
+      if (nextMap.size > 3500) {
+        const keepMin = Math.max(0, start - 1200);
+        const keepMax = start + count + 1200;
+        for (const key of nextMap.keys()) {
+          if (key < keepMin || key > keepMax) {
+            nextMap.delete(key);
           }
         }
+      }
 
-        linesMap = nextMap;
-      }).catch((err) => {
-        console.error("Failed to fetch slice:", err);
-      });
-    }
+      linesMap = nextMap;
+      pendingFetchRange = null;
+    }).catch((err) => {
+      console.error("Failed to fetch slice:", err);
+      pendingFetchRange = null;
+    });
   });
 
   function performAutoScrollBottom(smooth = false) {
@@ -226,6 +267,7 @@
 
   // Handle scroll events
   function handleScroll(e: Event) {
+    if (contextMenu) closeContextMenu();
     const target = e.currentTarget as HTMLDivElement;
     scrollTop = target.scrollTop;
     const isAtBottom = target.scrollTop + target.clientHeight >= target.scrollHeight - 32;
@@ -292,6 +334,7 @@
 
   export function clearCache() {
     linesMap = new Map();
+    pendingFetchRange = null;
     freshRows = new Set();
     prevTotalLines = 0;
     if (clearFreshTimer) {
@@ -302,6 +345,7 @@
 
   // Invalidate cache for rows at or above a given row index (e.g. on append or fold toggle)
   export function invalidateFromLine(fromLine: number) {
+    pendingFetchRange = null;
     if (linesMap.size === 0) return;
     const nextMap = new Map(linesMap);
     let changed = false;
@@ -324,6 +368,76 @@
     return undefined;
   }
 
+  // Context Menu State
+  interface ContextMenuState {
+    x: number;
+    y: number;
+    lineData: LogLine | null;
+    rawContent: string;
+    targetWord: string | null;
+  }
+  let contextMenu = $state<ContextMenuState | null>(null);
+
+  function handleRowContextMenu(e: MouseEvent, lineData: LogLine | null | undefined, rawContent: string) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Check if user selected some text
+    const sel = window.getSelection()?.toString().trim();
+    let wordToMap: string | null = null;
+
+    if (sel && sel.length > 0 && sel.length <= 40) {
+      // Clean selected text from brackets/quotes
+      wordToMap = sel.replace(/^[\[\("']+|[\]\)"',:;]+$/g, "").trim();
+    } else {
+      // Try to find a capitalized word or word in brackets from the line
+      const bracketMatch = /\[([A-Za-z0-9_\-]{2,20})\]/.exec(rawContent);
+      if (bracketMatch) {
+        wordToMap = bracketMatch[1];
+      } else {
+        const wordMatch = /\b([A-Z]{3,15})\b/.exec(rawContent);
+        if (wordMatch) {
+          wordToMap = wordMatch[1];
+        }
+      }
+    }
+
+    const menuWidth = 240;
+    const menuHeight = 260;
+    const posX = Math.min(e.clientX, window.innerWidth - menuWidth - 10);
+    const posY = Math.min(e.clientY, window.innerHeight - menuHeight - 10);
+
+    contextMenu = {
+      x: Math.max(10, posX),
+      y: Math.max(10, posY),
+      lineData: lineData ?? null,
+      rawContent,
+      targetWord: wordToMap && wordToMap.length > 0 ? wordToMap : null,
+    };
+  }
+
+  function closeContextMenu() {
+    contextMenu = null;
+  }
+
+  function handleMapWord(level: StandardLogLevel) {
+    if (!contextMenu?.targetWord) return;
+    const word = contextMenu.targetWord;
+    logLevelsManager.addKeyword(level, word);
+    onQuickMapLevel?.(word, level);
+    closeContextMenu();
+  }
+
+  async function handleCopyLineContent() {
+    if (!contextMenu?.rawContent) return;
+    try {
+      await navigator.clipboard.writeText(contextMenu.rawContent);
+    } catch (e) {
+      console.error("Errore copia:", e);
+    }
+    closeContextMenu();
+  }
+
   onMount(() => {
     handleResize();
     const ro = new ResizeObserver(() => handleResize());
@@ -338,13 +452,29 @@
       }
     }
 
+    function handleGlobalClick(e: MouseEvent) {
+      if (contextMenu) {
+        closeContextMenu();
+      }
+    }
+
+    function handleGlobalKeydown(e: KeyboardEvent) {
+      if (e.key === "Escape" && contextMenu) {
+        closeContextMenu();
+      }
+    }
+
     document.addEventListener("selectionchange", checkSelection);
     window.addEventListener("mouseup", handleGlobalMouseUp);
+    window.addEventListener("click", handleGlobalClick);
+    window.addEventListener("keydown", handleGlobalKeydown);
 
     return () => {
       ro.disconnect();
       document.removeEventListener("selectionchange", checkSelection);
       window.removeEventListener("mouseup", handleGlobalMouseUp);
+      window.removeEventListener("click", handleGlobalClick);
+      window.removeEventListener("keydown", handleGlobalKeydown);
       if (clearFreshTimer) {
         clearTimeout(clearFreshTimer);
         clearFreshTimer = null;
@@ -378,8 +508,7 @@
         class="absolute left-0 top-0 w-full min-w-full will-change-transform"
         style="transform: translateY({startOffsetY}px);"
       >
-        {#each Array(renderedCount) as _, i}
-          {@const rowIndex = startIndex + i}
+        {#each visibleRowIndices as rowIndex (rowIndex)}
           {@const lineData = linesMap.get(rowIndex)}
           {@const rawContent = lineData ? lineData.content : ""}
           {@const lineNum = lineData ? lineData.line_number : rowIndex + 1}
@@ -392,6 +521,7 @@
             <div
               role="row"
               tabindex="-1"
+              oncontextmenu={(e) => handleRowContextMenu(e, lineData, rawContent)}
               onmousedown={(e) => handleRowMouseDown(e, lineNum)}
               onmouseenter={(e) => handleRowMouseEnter(e, lineNum)}
               onclick={(e) => {
@@ -446,6 +576,7 @@
             <div
               role="row"
               tabindex="-1"
+              oncontextmenu={(e) => handleRowContextMenu(e, lineData, rawContent)}
               onmousedown={(e) => handleRowMouseDown(e, lineNum)}
               onmouseenter={(e) => handleRowMouseEnter(e, lineNum)}
               onclick={(e) => {
@@ -543,6 +674,90 @@
       {matchLines}
       onSeek={(line) => scrollToIndex(line - 1)}
     />
+  {/if}
+
+  <!-- Context Menu Fluttuante per In-Place Mapping & Azioni -->
+  {#if contextMenu}
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div
+      role="menu"
+      tabindex="-1"
+      class="fixed z-50 min-w-[210px] bg-[#0E121A]/95 backdrop-blur-md border border-white/[0.12] rounded-xl shadow-2xl p-1.5 text-xs text-[#F4F6FB] animate-scale-up select-none"
+      style="left: {contextMenu.x}px; top: {contextMenu.y}px;"
+      onclick={(e) => e.stopPropagation()}
+    >
+      {#if contextMenu.targetWord}
+        <div class="px-2 py-1.5 text-[11px] text-[#7E879B] border-b border-white/[0.08] mb-1 flex items-center gap-1.5 truncate">
+          <span>Mappa</span>
+          <span class="font-mono font-bold text-white max-w-[120px] truncate">"{contextMenu.targetWord}"</span>
+          <span>come:</span>
+        </div>
+
+        <button
+          onclick={() => handleMapWord("ERROR")}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left group"
+        >
+          <span class="text-[#E2E8F0] group-hover:text-white">🔴 Error</span>
+          <span class="text-[9.5px] font-mono text-rose-300 bg-rose-500/20 px-1.5 py-0.5 rounded">ERR</span>
+        </button>
+
+        <button
+          onclick={() => handleMapWord("WARN")}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left group"
+        >
+          <span class="text-[#E2E8F0] group-hover:text-white">🟡 Warning</span>
+          <span class="text-[9.5px] font-mono text-amber-300 bg-amber-500/20 px-1.5 py-0.5 rounded">WARN</span>
+        </button>
+
+        <button
+          onclick={() => handleMapWord("INFO")}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left group"
+        >
+          <span class="text-[#E2E8F0] group-hover:text-white">🔵 Info</span>
+          <span class="text-[9.5px] font-mono text-sky-300 bg-sky-500/20 px-1.5 py-0.5 rounded">INFO</span>
+        </button>
+
+        <button
+          onclick={() => handleMapWord("DEBUG")}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left group"
+        >
+          <span class="text-[#E2E8F0] group-hover:text-white">⚪ Debug</span>
+          <span class="text-[9.5px] font-mono text-slate-300 bg-slate-500/20 px-1.5 py-0.5 rounded">DBG</span>
+        </button>
+
+        <button
+          onclick={() => handleMapWord("TRACE")}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left group"
+        >
+          <span class="text-[#E2E8F0] group-hover:text-white">🟣 Trace</span>
+          <span class="text-[9.5px] font-mono text-purple-300 bg-purple-500/20 px-1.5 py-0.5 rounded">TRC</span>
+        </button>
+
+        <div class="h-px bg-white/[0.08] my-1"></div>
+      {/if}
+
+      <button
+        onclick={handleCopyLineContent}
+        class="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left text-[#B4BCD0] hover:text-white"
+      >
+        <svg class="w-3.5 h-3.5 text-[#7E879B]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+        </svg>
+        <span>Copia riga</span>
+      </button>
+
+      <button
+        onclick={() => { closeContextMenu(); onOpenLogLevels?.(); }}
+        class="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left text-[#B4BCD0] hover:text-white"
+      >
+        <svg class="w-3.5 h-3.5 text-[#7E879B]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+        </svg>
+        <span>Configura livelli di log...</span>
+      </button>
+    </div>
   {/if}
 </div>
 

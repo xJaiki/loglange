@@ -11,6 +11,8 @@
   import JsonDrawer from "$lib/components/JsonDrawer.svelte";
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import TabBar from "$lib/components/TabBar.svelte";
+  import LogLevelsModal from "$lib/components/LogLevelsModal.svelte";
+  import { logLevelsManager } from "$lib/stores/logLevels.svelte";
   import type {
     FileOpenResult,
     FilterUpdatedPayload,
@@ -89,6 +91,7 @@
 
   // Command Palette & Toasts
   let isCommandPaletteOpen = $state(false);
+  let isLogLevelsModalOpen = $state(false);
   let toastMessage = $state<string | null>(null);
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
   let copiedSnippet = $state(false);
@@ -106,8 +109,10 @@
 
   let activeQuickPreset = $derived.by<QuickFilterPreset | null>(() => {
     if (!searchQuery) return "all";
-    if (isRegex && searchQuery === "\\b(FATAL|CRITICAL|PANIC|ERROR|ERR)\\b") return "errors";
-    if (isRegex && searchQuery === "\\b(WARN|WARNING)\\b") return "warnings";
+    const errRx = logLevelsManager.getFilterRegex("ERROR");
+    const warnRx = logLevelsManager.getFilterRegex("WARN");
+    if (isRegex && errRx && searchQuery === errRx) return "errors";
+    if (isRegex && warnRx && searchQuery === warnRx) return "warnings";
     if (!isRegex && searchQuery === "{") return "json";
     return null;
   });
@@ -122,10 +127,10 @@
     activeTab.caseSensitive = false;
     if (preset === "errors") {
       activeTab.isRegex = true;
-      activeTab.searchQuery = "\\b(FATAL|CRITICAL|PANIC|ERROR|ERR)\\b";
+      activeTab.searchQuery = logLevelsManager.getFilterRegex("ERROR");
     } else if (preset === "warnings") {
       activeTab.isRegex = true;
-      activeTab.searchQuery = "\\b(WARN|WARNING)\\b";
+      activeTab.searchQuery = logLevelsManager.getFilterRegex("WARN");
     } else if (preset === "json") {
       activeTab.isRegex = false;
       activeTab.searchQuery = "{";
@@ -671,6 +676,9 @@
           switchTab(payload);
         }
         break;
+      case "configure_log_levels":
+        isLogLevelsModalOpen = true;
+        break;
     }
   }
 
@@ -909,6 +917,13 @@
       return;
     }
 
+    // Toggle log levels customization modal: Alt + L
+    if (e.altKey && e.key.toLowerCase() === "l") {
+      e.preventDefault();
+      isLogLevelsModalOpen = !isLogLevelsModalOpen;
+      return;
+    }
+
     // Quick filter focus: Vim-style "/" or Cmd/Ctrl + F
     if ((e.key === "/" && !isInputFocused(e.target)) || ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f")) {
       e.preventDefault();
@@ -1114,20 +1129,20 @@
     }
   }}
 >
-  <!-- Zona 1: Top Header Command Bar (h-12) -->
-  <header class="flex items-center justify-between px-4 h-12 border-b border-white/[0.08] bg-gradient-to-b from-[#171B26] to-[#12151E] shadow-[0_1px_8px_rgba(0,0,0,0.4)] shrink-0 text-xs font-sans gap-3 z-20">
-    <!-- 1. Sinistra: Brand -->
-    <div class="flex items-center gap-3 min-w-0 shrink-0">
-      <div class="flex items-center gap-2.5">
-        <div class="w-7 h-7 rounded-lg bg-amber-500/15 ring-1 ring-inset ring-amber-400/35 shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_2px_8px_rgba(245,158,11,0.2)] flex items-center justify-center text-amber-300 shrink-0">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M4 6h16M4 12h10M4 18h14" />
-          </svg>
+  <!-- Zona 1: Top Header Command Bar (h-12) - Visibile solo a file aperto -->
+  {#if activeTab}
+    <header class="flex items-center justify-between px-4 h-12 border-b border-white/[0.08] bg-gradient-to-b from-[#171B26] to-[#12151E] shadow-[0_1px_8px_rgba(0,0,0,0.4)] shrink-0 text-xs font-sans gap-3 z-20">
+      <!-- 1. Sinistra: Brand -->
+      <div class="flex items-center gap-3 min-w-0 shrink-0">
+        <div class="flex items-center gap-2.5">
+          <div class="w-7 h-7 rounded-lg bg-amber-500/15 ring-1 ring-inset ring-amber-400/35 shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_2px_8px_rgba(245,158,11,0.2)] flex items-center justify-center text-amber-300 shrink-0">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M4 6h16M4 12h10M4 18h14" />
+            </svg>
+          </div>
+          <span class="font-sans font-bold text-[14px] tracking-tight text-white">Loglance</span>
         </div>
-        <span class="font-sans font-bold text-[14px] tracking-tight text-white">Loglance</span>
-      </div>
 
-      {#if activeTab}
         <button
           onclick={handleOpenFilePicker}
           class="tactile-button hidden sm:flex items-center gap-2 px-2.5 py-1 rounded-lg cursor-pointer max-w-[240px] truncate"
@@ -1139,8 +1154,7 @@
           <span class="font-semibold text-[#F4F6FB] truncate">{activeTab.fileName}</span>
           <span class="text-[#B4BCD0] text-[11px] font-mono shrink-0">{formatBytes(activeTab.fileSize)}</span>
         </button>
-      {/if}
-    </div>
+      </div>
 
     <!-- 2. Centro: Search & Filter Bar Integrata (per tab attivo) -->
     {#if activeTab}
@@ -1200,6 +1214,17 @@
             <span class="font-mono text-[10px] text-emerald-300 font-bold">&#123;&#125;</span>
             <span>JSON</span>
           </button>
+          <div class="w-px h-3.5 bg-white/[0.1] my-auto mx-0.5"></div>
+          <button
+            onclick={() => (isLogLevelsModalOpen = true)}
+            class="px-2 py-1 rounded-lg text-[11px] font-medium transition-all duration-150 active:scale-95 cursor-pointer text-[#7E879B] hover:text-white hover:bg-white/[0.06] flex items-center gap-1"
+            title="Personalizza parole chiave dei livelli (Error, Warning, Info...)"
+          >
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+            </svg>
+            <span class="hidden xl:inline">Livelli</span>
+          </button>
         </div>
 
         {#if foldingStatus.total_groups > 0}
@@ -1243,6 +1268,7 @@
       </button>
     </div>
   </header>
+  {/if}
 
   <!-- Zona 1.5: Tab Bar per la navigazione multi-log -->
   {#if tabs.length > 0}
@@ -1293,6 +1319,13 @@
           onUserScrollUp={pauseLive}
           onUserScrollBottom={resumeLive}
           onSelectionPause={pauseLive}
+          onOpenLogLevels={() => (isLogLevelsModalOpen = true)}
+          onQuickMapLevel={(word, level) => {
+            showToast(`Mappato "${word}" come ${level}`);
+            if (activeQuickPreset === "errors" || activeQuickPreset === "warnings") {
+              scheduleSearch(true);
+            }
+          }}
           onScrollChange={(info) => {
             isAtBottom = info.isAtBottom;
             if (activeTab) {
@@ -1362,14 +1395,23 @@
       {:else}
         <!-- Zona 2: Home Screen "Loglance Hub" Emozionante, Minimale & Fluida -->
         <div class="relative flex flex-col items-center justify-center h-full p-6 font-sans overflow-hidden select-none">
-          <!-- Ambient Aurora Backlight (respira dolcemente al centro) -->
-          <div class="absolute w-[620px] h-[360px] rounded-full bg-gradient-to-tr from-amber-500/10 via-indigo-600/15 to-sky-400/10 blur-[130px] pointer-events-none -translate-x-1/2 -translate-y-1/2 left-1/2 top-1/2 animate-aurora"></div>
+          <!-- Subtle Tech Dot-Grid with Radial Vignette -->
+          <div
+            class="absolute inset-0 pointer-events-none opacity-30"
+            style="background-image: radial-gradient(rgba(255, 255, 255, 0.15) 1px, transparent 1px); background-size: 24px 24px; mask-image: radial-gradient(ellipse 75% 65% at 50% 50%, black 20%, transparent 85%);"
+          ></div>
 
-          <!-- Hero Floating Card -->
-          <div class="relative z-10 flex flex-col items-center max-w-xl text-center space-y-8 animate-float-hero">
+          <!-- Modern Top Ambient Glare Spotlight (Soft Indigo Ceiling Wash) -->
+          <div class="absolute -top-36 left-1/2 -translate-x-1/2 w-[700px] h-[360px] bg-gradient-to-b from-indigo-500/20 via-sky-400/08 to-transparent rounded-full blur-[100px] pointer-events-none"></div>
+
+          <!-- Ambient Core Backlight (respira dolcemente al centro) -->
+          <div class="absolute w-[560px] h-[320px] rounded-full bg-gradient-to-tr from-amber-500/12 via-indigo-600/12 to-sky-400/08 blur-[120px] pointer-events-none -translate-x-1/2 -translate-y-1/2 left-1/2 top-1/2 animate-aurora"></div>
+
+          <!-- Hero Card: Rock-Solid Static Position (Zero fluttuazione, bottoni fermi) -->
+          <div class="relative z-10 flex flex-col items-center max-w-xl text-center space-y-7">
             <!-- Iconic Glowing Badge -->
             <div class="relative group">
-              <div class="absolute -inset-2 rounded-3xl bg-gradient-to-r from-amber-500/30 via-indigo-500/30 to-sky-500/30 blur-lg opacity-40 group-hover:opacity-75 transition duration-500"></div>
+              <div class="absolute -inset-2 rounded-3xl bg-gradient-to-r from-amber-500/25 via-indigo-500/25 to-sky-500/25 blur-lg opacity-40 group-hover:opacity-75 transition duration-500"></div>
               <div class="relative w-20 h-20 rounded-2xl bg-gradient-to-b from-[#1E2333] to-[#121520] ring-1 ring-white/15 shadow-[0_16px_40px_rgba(0,0,0,0.6),inset_0_1px_0_rgba(255,255,255,0.2)] flex items-center justify-center text-amber-300">
                 <svg class="w-10 h-10 transition-transform duration-300 group-hover:scale-110" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M13 10V3L4 14h7v7l9-11h-7z" />
@@ -1377,24 +1419,15 @@
               </div>
             </div>
 
-            <!-- Title & Pitch -->
-            <div class="space-y-3">
-              <h1 class="text-3xl sm:text-4xl font-extrabold tracking-tight text-white flex items-center justify-center gap-3">
-                <span>Loglance</span>
-                <span class="text-xs font-mono font-semibold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 ring-1 ring-inset ring-amber-400/30">
-                  Zero-Lag Core
-                </span>
-              </h1>
-              <p class="text-sm sm:text-base text-[#9AA5BE] max-w-md mx-auto leading-relaxed">
-                Visualizzatore log in tempo reale per file da <span class="text-white font-medium">100MB a 10GB</span>.
-                Zero attese, memory-mapped SIMD e streaming 120 FPS.
-              </p>
-            </div>
+            <!-- Title -->
+            <h1 class="text-3xl sm:text-4xl font-extrabold tracking-tight text-white">
+              Loglance
+            </h1>
 
             <!-- Drag & Drop Interactive Dropzone Card -->
             <div
               onclick={handleOpenFilePicker}
-              class="group/drop w-full p-6 sm:p-8 rounded-2xl bg-[#131722]/80 hover:bg-[#181D2C]/90 border-2 border-dashed {isDragging ? 'border-amber-400 bg-amber-500/10 scale-[1.02]' : 'border-white/[0.12] hover:border-amber-400/50'} transition-all duration-200 cursor-pointer shadow-[0_8px_30px_rgba(0,0,0,0.4)] flex flex-col items-center gap-3.5"
+              class="group/drop w-full p-6 sm:p-8 rounded-2xl bg-[#12151E]/80 hover:bg-[#161B27]/90 border border-dashed {isDragging ? "border-amber-400 bg-amber-500/10 ring-2 ring-amber-400/30" : "border-white/[0.12] hover:border-amber-400/50"} backdrop-blur-xl transition-colors duration-200 cursor-pointer shadow-[0_16px_40px_rgba(0,0,0,0.5),inset_0_1px_0_rgba(255,255,255,0.1)] flex flex-col items-center gap-3.5"
               role="button"
               tabindex="0"
               onkeydown={(e) => {
@@ -1419,8 +1452,9 @@
                 </p>
               </div>
 
+              <!-- Static Action Buttons: Fermi e solidi con micro-interazione al click -->
               <div class="flex items-center gap-2 pt-1">
-                <span class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 text-black font-semibold text-xs shadow-md group-hover/drop:bg-amber-400 transition-colors">
+                <span class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 text-black font-semibold text-xs shadow-md group-hover/drop:bg-amber-400 active:scale-[0.98] transition-all">
                   <span>Sfoglia File</span>
                   <kbd class="text-[10px] bg-black/20 text-black px-1.5 py-0.5 rounded font-mono font-bold">⌘O</kbd>
                 </span>
@@ -1431,7 +1465,7 @@
                     e.stopPropagation();
                     isCommandPaletteOpen = true;
                   }}
-                  class="px-3 py-1.5 rounded-lg bg-white/[0.06] hover:bg-white/[0.1] text-xs font-semibold text-[#D8DFEE] ring-1 ring-inset ring-white/[0.1] transition-colors"
+                  class="px-3 py-1.5 rounded-lg bg-white/[0.06] hover:bg-white/[0.1] active:scale-[0.98] text-xs font-semibold text-[#D8DFEE] ring-1 ring-inset ring-white/[0.1] transition-all cursor-pointer"
                 >
                   Tavolozza Comandi <kbd class="text-[10px] text-[#A6B2C8] ml-1 font-mono">⌘K</kbd>
                 </button>
@@ -1442,8 +1476,9 @@
             <div class="flex flex-col sm:flex-row items-center gap-2 text-xs text-[#7E879B]">
               <span class="text-[#9AA5BE]">Oppure fai streaming diretto dal terminale:</span>
               <button
+                type="button"
                 onclick={copyCliSnippet}
-                class="group/cli flex items-center gap-2 px-3 py-1 rounded-lg bg-black/40 hover:bg-black/60 ring-1 ring-inset ring-white/[0.1] text-[#E0E7FF] font-mono text-[11px] transition-all duration-150 cursor-pointer active:scale-95"
+                class="group/cli flex items-center gap-2 px-3 py-1 rounded-lg bg-black/40 hover:bg-black/60 ring-1 ring-inset ring-white/[0.1] text-[#E0E7FF] font-mono text-[11px] transition-all cursor-pointer active:scale-[0.98]"
                 title="Clicca per copiare il comando negli appunti"
               >
                 <span class="text-amber-400">$</span>
@@ -1463,7 +1498,7 @@
           transition:fade={{ duration: 120 }}
           class="absolute inset-0 bg-indigo-950/70 backdrop-blur-sm z-50 flex flex-col items-center justify-center p-6 border-2 border-dashed border-sky-400 pointer-events-none gap-4"
         >
-          <div class="w-16 h-16 rounded-2xl bg-sky-500/20 ring-1 ring-sky-400/40 text-sky-300 flex items-center justify-center animate-bounce shadow-[0_0_24px_rgba(56,189,248,0.4)]">
+          <div class="w-16 h-16 rounded-2xl bg-sky-500/20 ring-1 ring-sky-400/40 text-sky-300 flex items-center justify-center shadow-[0_0_28px_rgba(56,189,248,0.4)]">
             <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
             </svg>
@@ -1502,11 +1537,11 @@
     />
   {/if}
 
-  <!-- Zona 3: Bottom Status Bar Minimalista (h-7 / 28px) -->
-  <footer class="h-7 px-3.5 bg-[#12151E] border-t border-white/[0.08] text-[11px] font-sans flex items-center justify-between text-[#B4BCD0] shrink-0 z-20">
-    <!-- Sinistra: LIVE / PAUSED + Conteggio righe -->
-    <div class="flex items-center gap-3 truncate">
-      {#if activeTab}
+  <!-- Zona 3: Bottom Status Bar Minimalista (h-7 / 28px) - Visibile solo a file aperto -->
+  {#if activeTab}
+    <footer class="h-7 px-3.5 bg-[#12151E] border-t border-white/[0.08] text-[11px] font-sans flex items-center justify-between text-[#B4BCD0] shrink-0 z-20">
+      <!-- Sinistra: LIVE / PAUSED + Conteggio righe -->
+      <div class="flex items-center gap-3 truncate">
         {#if isLive}
           <button
             onclick={pauseLive}
@@ -1550,19 +1585,15 @@
             </span>
           {/if}
         </div>
-      {:else}
-        <span class="text-[#7E879B]">Pronto</span>
-      {/if}
-    </div>
+      </div>
 
-    <!-- Destra: Indicatore colonne + Schede aperte + Vai alla fine -->
-    <div class="flex items-center gap-3 shrink-0">
-      {#if tabs.length > 1}
-        <span class="text-[10.5px] text-[#7E879B] font-mono">
-          {tabs.length} schede
-        </span>
-      {/if}
-      {#if activeTab}
+      <!-- Destra: Indicatore colonne + Schede aperte + Vai alla fine -->
+      <div class="flex items-center gap-3 shrink-0">
+        {#if tabs.length > 1}
+          <span class="text-[10.5px] text-[#7E879B] font-mono">
+            {tabs.length} schede
+          </span>
+        {/if}
         <span class="hidden sm:inline text-[10.5px] text-[#7E879B]">
           Colonne: Riga · Orario · Livello · Messaggio
         </span>
@@ -1575,9 +1606,9 @@
             Vai alla fine (Space)
           </button>
         {/if}
-      {/if}
-    </div>
-  </footer>
+      </div>
+    </footer>
+  {/if}
 
   <!-- Step 5: Toast Notification -->
   {#if toastMessage}
@@ -1607,6 +1638,17 @@
     onClose={() => (isCommandPaletteOpen = false)}
     onAction={handlePaletteAction}
   />
+
+  <!-- Modal Personalizzazione Livelli di Log -->
+  <LogLevelsModal
+    isOpen={isLogLevelsModalOpen}
+    onClose={() => {
+      isLogLevelsModalOpen = false;
+      if (activeQuickPreset === "errors" || activeQuickPreset === "warnings") {
+        scheduleSearch(true);
+      }
+    }}
+  />
 </div>
 
 <style>
@@ -1621,28 +1663,13 @@
     }
   }
 
-  @keyframes floatHero {
-    0%, 100% {
-      transform: translateY(0px);
-    }
-    50% {
-      transform: translateY(-8px);
-    }
-  }
-
   .animate-aurora {
     animation: auroraPulse 8s ease-in-out infinite;
     will-change: transform, opacity;
   }
 
-  .animate-float-hero {
-    animation: floatHero 4s ease-in-out infinite;
-    will-change: transform;
-  }
-
   @media (prefers-reduced-motion: reduce) {
-    .animate-aurora,
-    .animate-float-hero {
+    .animate-aurora {
       animation: none !important;
     }
   }

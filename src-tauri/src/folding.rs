@@ -1,5 +1,6 @@
 use crate::indexer::{LogIndex, LogLine};
 use parking_lot::RwLock;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -17,6 +18,17 @@ pub enum DisplayRow {
     CollapsedGroup(usize),  // group id in FoldingState
 }
 
+/// Compact interval representing a collapsed stacktrace group for zero-allocation O(log K) virtual list mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollapsedInterval {
+    pub group_id: usize,
+    pub start_line_0: usize, // 0-based index of first line in group
+    pub end_line_0: usize,   // 0-based index of last line in group (inclusive)
+    pub line_count: usize,
+    pub display_row: usize,  // 0-based virtual display row index
+    pub cum_saved: usize,    // Cumulative lines collapsed up to and including this interval
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoldingStatus {
     pub total_groups: usize,
@@ -25,6 +37,7 @@ pub struct FoldingStatus {
 }
 
 /// Checks whether raw line bytes match common stacktrace frame signatures.
+#[inline]
 pub fn is_stacktrace_line(raw: &[u8]) -> bool {
     let mut i = 0;
     while i < raw.len() && (raw[i] == b' ' || raw[i] == b'\t') {
@@ -84,7 +97,7 @@ pub fn is_stacktrace_line(raw: &[u8]) -> bool {
 pub struct FoldingState {
     pub groups: Vec<StacktraceGroup>,
     pub auto_collapse_enabled: bool,
-    pub display_rows: Vec<DisplayRow>,
+    pub collapsed_intervals: Vec<CollapsedInterval>,
     pub total_lines: usize,
 }
 
@@ -93,7 +106,7 @@ impl Default for FoldingState {
         Self {
             groups: Vec::new(),
             auto_collapse_enabled: true,
-            display_rows: Vec::new(),
+            collapsed_intervals: Vec::new(),
             total_lines: 0,
         }
     }
@@ -120,56 +133,134 @@ impl FoldingManager {
     pub fn clear(&self) {
         let mut state = self.state.write();
         state.groups.clear();
-        state.display_rows.clear();
+        state.collapsed_intervals.clear();
         state.total_lines = 0;
     }
 
     /// Scans the entire index to detect consecutive stacktrace runs (>= 2 lines)
-    /// and populates the display row mappings.
+    /// and populates the display row mappings. Parallelized via Rayon for large files.
     pub fn scan_index(&self, index: &LogIndex) {
         let total = index.total_lines();
-        let mut groups = Vec::new();
-        let mut current_group_start: Option<usize> = None;
+        if total == 0 {
+            let mut state = self.state.write();
+            state.groups.clear();
+            state.collapsed_intervals.clear();
+            state.total_lines = 0;
+            return;
+        }
 
-        for line_idx in 0..total {
-            let is_st = if let Some(raw) = index.get_line_raw(line_idx) {
-                is_stacktrace_line(raw)
-            } else {
-                false
-            };
+        // Parallel chunk scanning for files with > 16384 lines
+        const PARALLEL_THRESHOLD: usize = 16384;
+        const CHUNK_SIZE: usize = 16384;
 
-            if is_st {
-                if current_group_start.is_none() {
-                    current_group_start = Some(line_idx);
+        let groups = if total > PARALLEL_THRESHOLD {
+            let chunk_count = (total + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            // Each chunk returns local runs: (start_line_0, end_line_0_inclusive)
+            let chunk_runs: Vec<Vec<(usize, usize)>> = (0..chunk_count)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start_line = chunk_idx * CHUNK_SIZE;
+                    let end_line = (start_line + CHUNK_SIZE).min(total);
+                    let mut local_runs = Vec::new();
+                    let mut current_start: Option<usize> = None;
+
+                    for line_idx in start_line..end_line {
+                        let is_st = if let Some(raw) = index.get_line_raw(line_idx) {
+                            is_stacktrace_line(raw)
+                        } else {
+                            false
+                        };
+
+                        if is_st {
+                            if current_start.is_none() {
+                                current_start = Some(line_idx);
+                            }
+                        } else if let Some(s) = current_start {
+                            local_runs.push((s, line_idx - 1));
+                            current_start = None;
+                        }
+                    }
+
+                    if let Some(s) = current_start {
+                        local_runs.push((s, end_line - 1));
+                    }
+
+                    local_runs
+                })
+                .collect();
+
+            // Stitch adjacent runs across chunk boundaries
+            let mut merged_runs: Vec<(usize, usize)> = Vec::new();
+            for chunk in chunk_runs {
+                for (start, end) in chunk {
+                    if let Some(last) = merged_runs.last_mut() {
+                        if last.1 + 1 == start {
+                            last.1 = end;
+                            continue;
+                        }
+                    }
+                    merged_runs.push((start, end));
                 }
-            } else if let Some(start_idx) = current_group_start {
-                let count = line_idx - start_idx;
+            }
+
+            // Keep only runs of >= 2 lines
+            merged_runs
+                .into_iter()
+                .filter(|(start, end)| end + 1 - start >= 2)
+                .enumerate()
+                .map(|(id, (start, end))| StacktraceGroup {
+                    id,
+                    start_line: start + 1,
+                    end_line: end + 1,
+                    line_count: end + 1 - start,
+                    expanded: false,
+                })
+                .collect()
+        } else {
+            let mut groups = Vec::new();
+            let mut current_group_start: Option<usize> = None;
+
+            for line_idx in 0..total {
+                let is_st = if let Some(raw) = index.get_line_raw(line_idx) {
+                    is_stacktrace_line(raw)
+                } else {
+                    false
+                };
+
+                if is_st {
+                    if current_group_start.is_none() {
+                        current_group_start = Some(line_idx);
+                    }
+                } else if let Some(start_idx) = current_group_start {
+                    let count = line_idx - start_idx;
+                    if count >= 2 {
+                        groups.push(StacktraceGroup {
+                            id: groups.len(),
+                            start_line: start_idx + 1, // 1-based
+                            end_line: line_idx,        // 1-based inclusive
+                            line_count: count,
+                            expanded: false,
+                        });
+                    }
+                    current_group_start = None;
+                }
+            }
+
+            // Handle trailing stacktrace run at EOF
+            if let Some(start_idx) = current_group_start {
+                let count = total - start_idx;
                 if count >= 2 {
                     groups.push(StacktraceGroup {
                         id: groups.len(),
-                        start_line: start_idx + 1, // 1-based
-                        end_line: line_idx,        // 1-based inclusive
+                        start_line: start_idx + 1,
+                        end_line: total,
                         line_count: count,
                         expanded: false,
                     });
                 }
-                current_group_start = None;
             }
-        }
-
-        // Handle trailing stacktrace run at EOF
-        if let Some(start_idx) = current_group_start {
-            let count = total - start_idx;
-            if count >= 2 {
-                groups.push(StacktraceGroup {
-                    id: groups.len(),
-                    start_line: start_idx + 1,
-                    end_line: total,
-                    line_count: count,
-                    expanded: false,
-                });
-            }
-        }
+            groups
+        };
 
         let mut state = self.state.write();
         state.groups = groups;
@@ -237,7 +328,7 @@ impl FoldingManager {
         state.rebuild_display_rows();
     }
 
-    /// Toggles a specific group's expanded state.
+    /// Toggles a specific group's expanded state in O(1) time without full document reallocations.
     pub fn toggle_group(&self, group_id: usize) -> Option<bool> {
         let mut state = self.state.write();
         if let Some(group) = state.groups.iter_mut().find(|g| g.id == group_id) {
@@ -279,21 +370,24 @@ impl FoldingManager {
         state.rebuild_display_rows();
     }
 
-    /// Returns the effective total row count for the virtual list.
+    /// Returns the effective total row count for the virtual list in O(1) time.
     pub fn total_display_rows(&self) -> usize {
         let state = self.state.read();
-        state.display_rows.len()
+        if !state.auto_collapse_enabled || state.collapsed_intervals.is_empty() {
+            return state.total_lines;
+        }
+        let total_saved = state.collapsed_intervals.last().map(|c| c.cum_saved).unwrap_or(0);
+        state.total_lines.saturating_sub(total_saved)
     }
 
     /// Returns high-level status of stacktraces in the document.
     pub fn get_status(&self) -> FoldingStatus {
         let state = self.state.read();
-        let total_collapsed_lines: usize = state
-            .groups
-            .iter()
-            .filter(|g| state.auto_collapse_enabled && !g.expanded)
-            .map(|g| g.line_count.saturating_sub(1))
-            .sum();
+        let total_collapsed_lines = if state.auto_collapse_enabled {
+            state.collapsed_intervals.last().map(|c| c.cum_saved).unwrap_or(0)
+        } else {
+            0
+        };
 
         FoldingStatus {
             total_groups: state.groups.len(),
@@ -302,61 +396,77 @@ impl FoldingManager {
         }
     }
 
-    /// Slices visible lines according to display row mapping (handling folded pills).
+    /// Slices visible lines according to display row mapping (handling folded pills) in O(log K) zero-allocation.
     pub fn get_display_slice(&self, index: &LogIndex, start_row: usize, count: usize) -> Vec<LogLine> {
         let state = self.state.read();
-        if state.display_rows.is_empty() || start_row >= state.display_rows.len() || count == 0 {
+        let total_display = if !state.auto_collapse_enabled || state.collapsed_intervals.is_empty() {
+            state.total_lines
+        } else {
+            let total_saved = state.collapsed_intervals.last().map(|c| c.cum_saved).unwrap_or(0);
+            state.total_lines.saturating_sub(total_saved)
+        };
+
+        if total_display == 0 || start_row >= total_display || count == 0 {
             return Vec::new();
         }
 
-        let end_row = (start_row + count).min(state.display_rows.len());
+        let end_row = (start_row + count).min(total_display);
         let mut lines = Vec::with_capacity(end_row - start_row);
 
+        if !state.auto_collapse_enabled || state.collapsed_intervals.is_empty() {
+            return index.get_lines_slice(start_row, end_row - start_row);
+        }
+
+        let intervals = &state.collapsed_intervals;
+        let mut interval_idx = intervals.partition_point(|it| it.display_row < start_row);
+
         for row_idx in start_row..end_row {
-            match state.display_rows[row_idx] {
-                DisplayRow::Single(line_idx) => {
-                    if let Some(raw) = index.get_line_raw(line_idx) {
-                        let mut content_slice = raw;
-                        if content_slice.ends_with(b"\n") {
-                            content_slice = &content_slice[..content_slice.len() - 1];
-                        }
-                        if content_slice.ends_with(b"\r") {
-                            content_slice = &content_slice[..content_slice.len() - 1];
-                        }
-                        let content = String::from_utf8_lossy(content_slice).into_owned();
-                        let is_st = is_stacktrace_line(raw);
-                        let byte_offset = index.get_line_offset(line_idx).unwrap_or(0);
+            if interval_idx < intervals.len() && intervals[interval_idx].display_row == row_idx {
+                let it = intervals[interval_idx];
+                let group = &state.groups[it.group_id];
+                let byte_offset = index.get_line_offset(it.start_line_0).unwrap_or(0);
 
-                        lines.push(LogLine {
-                            line_number: line_idx + 1,
-                            content,
-                            byte_offset,
-                            is_stacktrace: is_st,
-                            is_collapsed_group: false,
-                            group_id: None,
-                            group_line_count: None,
-                        });
+                lines.push(LogLine {
+                    line_number: group.start_line,
+                    content: format!(
+                        "    [+ {} stacktrace lines (lines {}-{}) — click to expand]",
+                        group.line_count, group.start_line, group.end_line
+                    ),
+                    byte_offset,
+                    is_stacktrace: true,
+                    is_collapsed_group: true,
+                    group_id: Some(group.id),
+                    group_line_count: Some(group.line_count),
+                });
+                interval_idx += 1;
+            } else {
+                let saved_before = if interval_idx == 0 {
+                    0
+                } else {
+                    intervals[interval_idx - 1].cum_saved
+                };
+                let line_idx = row_idx + saved_before;
+                if let Some(raw) = index.get_line_raw(line_idx) {
+                    let mut content_slice = raw;
+                    if content_slice.ends_with(b"\n") {
+                        content_slice = &content_slice[..content_slice.len() - 1];
                     }
-                }
-                DisplayRow::CollapsedGroup(group_id) => {
-                    if let Some(group) = state.groups.iter().find(|g| g.id == group_id) {
-                        let byte_offset = index
-                            .get_line_offset(group.start_line - 1)
-                            .unwrap_or(0);
+                    if content_slice.ends_with(b"\r") {
+                        content_slice = &content_slice[..content_slice.len() - 1];
+                    }
+                    let content = String::from_utf8_lossy(content_slice).into_owned();
+                    let is_st = is_stacktrace_line(raw);
+                    let byte_offset = index.get_line_offset(line_idx).unwrap_or(0);
 
-                        lines.push(LogLine {
-                            line_number: group.start_line,
-                            content: format!(
-                                "    [+ {} stacktrace lines (lines {}-{}) — click to expand]",
-                                group.line_count, group.start_line, group.end_line
-                            ),
-                            byte_offset,
-                            is_stacktrace: true,
-                            is_collapsed_group: true,
-                            group_id: Some(group.id),
-                            group_line_count: Some(group.line_count),
-                        });
-                    }
+                    lines.push(LogLine {
+                        line_number: line_idx + 1,
+                        content,
+                        byte_offset,
+                        is_stacktrace: is_st,
+                        is_collapsed_group: false,
+                        group_id: None,
+                        group_line_count: None,
+                    });
                 }
             }
         }
@@ -364,79 +474,62 @@ impl FoldingManager {
         lines
     }
 
-    /// Maps a 1-based log line number to its corresponding 0-based virtual display row.
+    /// Maps a 1-based log line number to its corresponding 0-based virtual display row in O(log K) time.
     /// If the line falls inside a collapsed stacktrace group, returns that group's placeholder row.
     pub fn line_to_display_row(&self, line_number: usize) -> usize {
         let state = self.state.read();
-        if !state.auto_collapse_enabled || state.groups.is_empty() {
-            return line_number.saturating_sub(1);
-        }
-
         let target_line_idx = line_number.saturating_sub(1);
-        if target_line_idx >= state.total_lines {
-            return state.display_rows.len().saturating_sub(1);
+        if !state.auto_collapse_enabled || state.collapsed_intervals.is_empty() {
+            return target_line_idx.min(state.total_lines.saturating_sub(1));
         }
 
-        let idx = state.display_rows.partition_point(|row| match row {
-            DisplayRow::Single(l_idx) => *l_idx < target_line_idx,
-            DisplayRow::CollapsedGroup(gid) => {
-                if let Some(g) = state.groups.iter().find(|g| g.id == *gid) {
-                    (g.end_line - 1) < target_line_idx
-                } else {
-                    false
-                }
-            }
-        });
+        if target_line_idx >= state.total_lines {
+            let total_saved = state.collapsed_intervals.last().map(|c| c.cum_saved).unwrap_or(0);
+            return state.total_lines.saturating_sub(total_saved).saturating_sub(1);
+        }
 
-        idx.min(state.display_rows.len().saturating_sub(1))
+        let intervals = &state.collapsed_intervals;
+        let idx = intervals.partition_point(|it| it.end_line_0 < target_line_idx);
+        if idx < intervals.len() {
+            let it = &intervals[idx];
+            if target_line_idx >= it.start_line_0 {
+                return it.display_row;
+            }
+        }
+
+        let saved_before = if idx == 0 {
+            0
+        } else {
+            intervals[idx - 1].cum_saved
+        };
+        target_line_idx.saturating_sub(saved_before)
     }
 }
 
 impl FoldingState {
     pub fn rebuild_display_rows(&mut self) {
+        self.collapsed_intervals.clear();
         if !self.auto_collapse_enabled || self.groups.is_empty() {
-            // When auto-collapse is disabled, 1:1 line mapping
-            self.display_rows = (0..self.total_lines).map(DisplayRow::Single).collect();
             return;
         }
 
-        let mut rows = Vec::with_capacity(self.total_lines);
-        let mut current_line = 0; // 0-based
-
+        let mut cum_saved = 0;
         for group in &self.groups {
-            let group_start_0 = group.start_line - 1;
-            let group_end_0 = group.end_line; // exclusive
-
-            // Push all lines preceding this group
-            while current_line < group_start_0 && current_line < self.total_lines {
-                rows.push(DisplayRow::Single(current_line));
-                current_line += 1;
-            }
-
-            if current_line >= self.total_lines {
-                break;
-            }
-
-            if group.expanded {
-                // If group is expanded, push individual lines
-                while current_line < group_end_0 && current_line < self.total_lines {
-                    rows.push(DisplayRow::Single(current_line));
-                    current_line += 1;
-                }
-            } else {
-                // Collapsed: push 1 single collapsed row representing the group
-                rows.push(DisplayRow::CollapsedGroup(group.id));
-                current_line = group_end_0;
+            if !group.expanded {
+                let start_line_0 = group.start_line - 1;
+                let end_line_0 = group.end_line - 1;
+                let display_row = start_line_0 - cum_saved;
+                cum_saved += group.line_count - 1;
+                self.collapsed_intervals.push(CollapsedInterval {
+                    group_id: group.id,
+                    start_line_0,
+                    end_line_0,
+                    line_count: group.line_count,
+                    display_row,
+                    cum_saved,
+                });
             }
         }
-
-        // Push any remaining lines after the last group
-        while current_line < self.total_lines {
-            rows.push(DisplayRow::Single(current_line));
-            current_line += 1;
-        }
-
-        self.display_rows = rows;
     }
 }
 

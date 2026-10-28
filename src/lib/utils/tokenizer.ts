@@ -1,6 +1,7 @@
 import { escapeHtml, escapeRegex } from "./highlight.js";
 import { findJsonSubstring, findXmlSubstring } from "./jsonExtractor.js";
 import type { LogLevel } from "$lib/types";
+import { logLevelsManager } from "$lib/stores/logLevels.svelte";
 
 export interface ParsedLineInfo {
   level: LogLevel | null;
@@ -15,12 +16,12 @@ export interface ParsedLineInfo {
 }
 
 // Regex patterns for tokens
-const LEVEL_REGEX = /\b(FATAL|CRITICAL|PANIC|ERROR|ERR|WARN|WARNING|INFO|NOTICE|DEBUG|TRACE|VERBOSE)\b/i;
 const TIMESTAMP_REGEX = /(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?|\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})/;
 const IPV4_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b/;
 const UUID_REGEX = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/;
 const HTTP_METHOD_REGEX = /\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\b/;
 const STACKTRACE_PREFIX_REGEX = /^\s*(?:at\s+|Caused by:|Traceback|File\s+"|\.\.\.\s+\d+\s+more|\d+:\s+0x)/;
+const EMBEDDED_JSON_QUICK_REGEX = /\{[\s\S]*"[^"]+"\s*:[\s\S]*\}/;
 
 export function detectLogLevel(text: string): {
   level: LogLevel | null;
@@ -28,56 +29,30 @@ export function detectLogLevel(text: string): {
   rowTintClass: string;
   textColor: string;
 } {
-  if (/\b(FATAL|CRITICAL|PANIC|ERROR|ERR)\b/i.test(text)) {
-    return {
-      level: "ERROR",
-      badgeClass: "bg-rose-500/20 text-rose-200 ring-1 ring-inset ring-rose-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]",
-      rowTintClass: "bg-rose-500/[0.055] hover:bg-rose-500/[0.11] border-l-2 border-rose-500/85",
-      textColor: "text-rose-300",
-    };
-  }
-  if (/\b(WARN|WARNING)\b/i.test(text)) {
-    return {
-      level: "WARN",
-      badgeClass: "bg-amber-500/20 text-amber-200 ring-1 ring-inset ring-amber-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]",
-      rowTintClass: "bg-amber-500/[0.04] hover:bg-amber-500/[0.09] border-l-2 border-amber-400/80",
-      textColor: "text-amber-300",
-    };
-  }
-  if (/\b(INFO|NOTICE)\b/i.test(text)) {
-    return {
-      level: "INFO",
-      badgeClass: "bg-sky-500/18 text-sky-200 ring-1 ring-inset ring-sky-400/35 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]",
-      rowTintClass: "hover:bg-white/[0.04] border-l-2 border-transparent",
-      textColor: "text-sky-300",
-    };
-  }
-  if (/\b(DEBUG)\b/i.test(text)) {
-    return {
-      level: "DEBUG",
-      badgeClass: "bg-slate-400/15 text-slate-200 ring-1 ring-inset ring-slate-400/30",
-      rowTintClass: "hover:bg-white/[0.04] border-l-2 border-transparent text-[#CBD5E1]",
-      textColor: "text-slate-300",
-    };
-  }
-  if (/\b(TRACE|VERBOSE)\b/i.test(text)) {
-    return {
-      level: "TRACE",
-      badgeClass: "bg-purple-500/20 text-purple-200 ring-1 ring-inset ring-purple-400/35",
-      rowTintClass: "hover:bg-white/[0.04] border-l-2 border-transparent text-[#B4BCD0]",
-      textColor: "text-purple-300",
-    };
-  }
-  return {
-    level: null,
-    badgeClass: "",
-    rowTintClass: "hover:bg-white/[0.04] border-l-2 border-transparent",
-    textColor: "text-[#F4F6FB]",
-  };
+  return logLevelsManager.detectLevel(text);
+}
+
+// Global cached compiled regexes and LRU tokenization cache to guarantee 60-120 FPS
+let lastLogLevelVersion = -1;
+let cachedCombinedRegex: RegExp | null = null;
+
+let lastSearchKey = "";
+let cachedSearchRe: RegExp | null = null;
+
+const TOKENIZE_CACHE_MAX = 8000;
+const tokenizeCache = new Map<string, ParsedLineInfo>();
+
+export function clearTokenizerCache() {
+  tokenizeCache.clear();
+  cachedCombinedRegex = null;
+  lastLogLevelVersion = -1;
+  cachedSearchRe = null;
+  lastSearchKey = "";
 }
 
 /**
  * Tokenizes a single log line into rich HTML with column extraction, syntax coloring, and search highlighting.
+ * Employs fast memoization to eliminate regex execution during scroll frames.
  */
 export function tokenizeLogLine(
   content: string,
@@ -85,6 +60,21 @@ export function tokenizeLogLine(
   isRegex: boolean = false,
   caseSensitive: boolean = false
 ): ParsedLineInfo {
+  // Svelte 5 reactive dependency tracking: ensures re-tokenization when user changes log level keywords
+  const levelVersion = logLevelsManager.version;
+  if (levelVersion !== lastLogLevelVersion) {
+    tokenizeCache.clear();
+    lastLogLevelVersion = levelVersion;
+    cachedCombinedRegex = null;
+  }
+
+  // Fast O(1) Cache Lookup
+  const cacheKey = `${content}\x1f${searchQuery}\x1f${isRegex ? 1 : 0}\x1f${caseSensitive ? 1 : 0}`;
+  const hit = tokenizeCache.get(cacheKey);
+  if (hit) {
+    return hit;
+  }
+
   const isStacktrace = STACKTRACE_PREFIX_REGEX.test(content);
   const { level, badgeClass, rowTintClass } = detectLogLevel(content);
 
@@ -113,10 +103,11 @@ export function tokenizeLogLine(
       }
     }
 
-    // 2. Extract leading log level if found within the first 25 chars of remaining workingContent
-    const levelSlice = workingContent.slice(0, 25);
-    const lvlMatch = LEVEL_REGEX.exec(levelSlice);
-    if (lvlMatch && lvlMatch.index <= 6) {
+    // 2. Extract leading log level if found within the first 30 chars of remaining workingContent
+    const levelRegex = logLevelsManager.getCombinedRegex();
+    const levelSlice = workingContent.slice(0, 30);
+    const lvlMatch = levelRegex.exec(levelSlice);
+    if (lvlMatch && lvlMatch.index <= 8) {
       const beforeLvl = workingContent.slice(0, lvlMatch.index).trim();
       const afterLvlIdx = lvlMatch.index + lvlMatch[0].length;
       if (beforeLvl === "" || beforeLvl === "[" || beforeLvl === "(") {
@@ -132,7 +123,7 @@ export function tokenizeLogLine(
   // Meaningful check for embedded JSON / XML structures (avoid log tags/PIDs like [1015] or <thread>)
   let hasJson = false;
   if (content.includes("{") && content.includes("}")) {
-    if (/\{[\s\S]*"[^"]+"\s*:[\s\S]*\}/.test(content) || findJsonSubstring(content) !== null) {
+    if (EMBEDDED_JSON_QUICK_REGEX.test(content) || findJsonSubstring(content) !== null) {
       hasJson = true;
     }
   } else if (content.includes("[{") || content.includes("[ {")) {
@@ -140,28 +131,41 @@ export function tokenizeLogLine(
   }
 
   let hasXml = false;
-  if (content.includes("<") && content.includes(">") && content.includes("</")) {
+  if (content.includes("</") && content.includes(">")) {
     hasXml = findXmlSubstring(content) !== null;
   }
 
-  // If search query is present, we wrap matching terms
+  // Compile / reuse search regex
   let searchRe: RegExp | null = null;
   if (searchQuery && searchQuery.trim().length > 0) {
-    try {
-      const flags = caseSensitive ? "g" : "gi";
-      const pattern = isRegex ? searchQuery : escapeRegex(searchQuery);
-      searchRe = new RegExp(pattern, flags);
-    } catch {
-      searchRe = null;
+    const sKey = `${searchQuery}\x1f${isRegex ? 1 : 0}\x1f${caseSensitive ? 1 : 0}`;
+    if (sKey === lastSearchKey && cachedSearchRe) {
+      searchRe = cachedSearchRe;
+    } else {
+      try {
+        const flags = caseSensitive ? "g" : "gi";
+        const pattern = isRegex ? searchQuery : escapeRegex(searchQuery);
+        searchRe = new RegExp(pattern, flags);
+        cachedSearchRe = searchRe;
+        lastSearchKey = sKey;
+      } catch {
+        searchRe = null;
+        cachedSearchRe = null;
+        lastSearchKey = "";
+      }
     }
   }
 
-  // Combined tokenizer regex matching semantic tokens
-  // Order matters: Timestamps, Levels, UUIDs, IPs, HTTP Methods
-  const combinedRegex = new RegExp(
-    `(${TIMESTAMP_REGEX.source})|(${LEVEL_REGEX.source})|(${UUID_REGEX.source})|(${IPV4_REGEX.source})|(${HTTP_METHOD_REGEX.source})`,
-    "gi"
-  );
+  // Combined tokenizer regex matching semantic tokens (cached statically)
+  if (!cachedCombinedRegex) {
+    const dynamicLevelRegex = logLevelsManager.getCombinedRegex();
+    cachedCombinedRegex = new RegExp(
+      `(${TIMESTAMP_REGEX.source})|(${dynamicLevelRegex.source})|(${UUID_REGEX.source})|(${IPV4_REGEX.source})|(${HTTP_METHOD_REGEX.source})`,
+      "gi"
+    );
+  }
+  const combinedRegex = cachedCombinedRegex;
+  combinedRegex.lastIndex = 0;
 
   let resultHtml = "";
   let lastIndex = 0;
@@ -207,7 +211,7 @@ export function tokenizeLogLine(
   const tail = workingContent.substring(lastIndex);
   resultHtml += renderWithSearchHighlight(tail, searchRe);
 
-  return {
+  const parsedInfo: ParsedLineInfo = {
     level,
     levelBadgeClass: badgeClass,
     rowTintClass,
@@ -218,6 +222,20 @@ export function tokenizeLogLine(
     isStacktrace,
     html: resultHtml,
   };
+
+  // Store in cache (bounded LRU-style prune)
+  if (tokenizeCache.size >= TOKENIZE_CACHE_MAX) {
+    // Drop first 1500 entries in bulk
+    const iter = tokenizeCache.keys();
+    for (let i = 0; i < 1500; i++) {
+      const nextKey = iter.next().value;
+      if (!nextKey) break;
+      tokenizeCache.delete(nextKey);
+    }
+  }
+  tokenizeCache.set(cacheKey, parsedInfo);
+
+  return parsedInfo;
 }
 
 /**

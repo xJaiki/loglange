@@ -140,6 +140,14 @@
       category: "Stream & View",
       icon: "code"
     },
+    {
+      id: "configure_log_levels",
+      title: "Configure Log Levels & Keywords",
+      subtitle: "Customize keywords for Error, Warning (e.g. ATTENZIONE), Info, Debug",
+      category: "Stream & View",
+      shortcut: "Alt+L",
+      icon: "settings"
+    },
 
     // Search & Filter
     {

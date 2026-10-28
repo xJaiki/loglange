@@ -458,6 +458,29 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_log_levels_regex_search() {
+        let log = "2026-10-28 [INFO] avvio\n2026-10-28 [ATTENZIONE] query lenta\n2026-10-28 [ERRORE] connessione persa\n2026-10-28 [AVVISO] disco quasi pieno\n";
+        let (_file, index) = create_test_file(log);
+
+        let manager = SearchManager::new();
+        // Query generata dinamicamente dal frontend per i Warning personalizzati
+        let res = manager
+            .search(
+                &index,
+                SearchOptions {
+                    query: r"\b(ATTENZIONE|WARNING|AVVISO|WARN)\b".to_string(),
+                    is_regex: true,
+                    case_sensitive: false,
+                    invert: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(res.total_matches, 2);
+        assert_eq!(res.match_lines, vec![2, 4]);
+    }
+
+    #[test]
     fn test_invalid_regex_error() {
         let log = "hello world\n";
         let (_file, index) = create_test_file(log);
