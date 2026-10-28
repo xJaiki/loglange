@@ -11,3 +11,15 @@ src-tauri/target
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 *.log
+
+# AI & Agents
+.agents/
+GEMINI.md
+context.md
+project_context_agent_rules.md
+.gemini/
+.claude/
+.cursor/
+.cursorrules
+.windsurf/
+

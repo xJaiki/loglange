@@ -57,6 +57,9 @@ jobs:
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
+        with:
+          version: 11
+          run_install: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -85,6 +88,10 @@ jobs:
             patchelf \
             xdg-utils
 
+      - name: Enable VBScript for WiX (Windows)
+        if: runner.os == 'Windows'
+        run: Dism /online /Enable-Feature /FeatureName:VBSCRIPT /NoRestart
+
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
@@ -93,9 +100,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v__VERSION__
-          releaseName: 'LogViewer v__VERSION__'
-          releaseBody: 'Automated release build of LogViewer.'
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || (github.event_name != 'pull_request' && 'v__VERSION__' || '') }}
+          releaseName: 'Loglance v__VERSION__'
+          releaseBody: 'Automated release build of Loglance.'
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
@@ -103,7 +110,7 @@ jobs:
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: logviewer-${{ matrix.name }}
+          name: loglance-${{ matrix.name }}
           path: |
             src-tauri/target/**/release/bundle/appimage/*.AppImage
             src-tauri/target/**/release/bundle/deb/*.deb
