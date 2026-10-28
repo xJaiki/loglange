@@ -1,6 +1,6 @@
 [package]
 name = "loglance"
-version = "0.1.0"
+version = "26.1.0"
 description = "Loglance — Ultra-Fast Minimalist Real-Time Log Viewer"
 authors = ["you"]
 edition = "2021"

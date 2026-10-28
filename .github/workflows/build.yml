@@ -18,7 +18,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  get-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+      display_version: ${{ steps.calc.outputs.display_version }}
+      tag_name: ${{ steps.calc.outputs.tag_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate Year and Incremental Version
+        id: calc
+        run: |
+          YEAR=$(date +"%y")
+          LATEST_TAG=$(git tag -l "v${YEAR}.*" | sort -V | tail -n 1)
+          if [ -z "$LATEST_TAG" ]; then
+            BUILD_NUM=1
+          else
+            CURRENT_NUM=$(echo "$LATEST_TAG" | sed -E "s/^v${YEAR}\.([0-9]+).*/\1/")
+            BUILD_NUM=$((CURRENT_NUM + 1))
+          fi
+          VERSION="${YEAR}.${BUILD_NUM}.0"
+          DISPLAY_VERSION="${YEAR}.${BUILD_NUM}"
+          TAG_NAME="v${YEAR}.${BUILD_NUM}"
+          echo "Calculated version: $VERSION (display: $DISPLAY_VERSION, tag: $TAG_NAME)"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "display_version=$DISPLAY_VERSION" >> $GITHUB_OUTPUT
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+
   build-tauri:
+    needs: get-version
     permissions:
       contents: write
     runs-on: ${{ matrix.platform }}
@@ -54,6 +86,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -63,6 +97,26 @@ jobs:
         with:
           node-version: 22
           cache: 'pnpm'
+
+      - name: Inject Dynamic Version into App Configs
+        shell: bash
+        run: |
+          VERSION="${{ needs.get-version.outputs.version }}"
+          echo "Injecting version $VERSION..."
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = '$VERSION';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+
+            const conf = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            conf.version = '$VERSION';
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2) + '\n');
+
+            let cargo = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+            cargo = cargo.replace(/^version\s*=\s*\"[^\"]+\"/m, 'version = \"$VERSION\"');
+            fs.writeFileSync('src-tauri/Cargo.toml', cargo);
+          "
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -93,8 +147,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || (github.event_name != 'pull_request' && 'v__VERSION__' || '') }}
-          releaseName: 'Loglance v__VERSION__'
+          tagName: ${{ github.event_name != 'pull_request' && needs.get-version.outputs.tag_name || '' }}
+          releaseName: 'Loglance v${{ needs.get-version.outputs.display_version }}'
           releaseBody: 'Automated release build of Loglance.'
           releaseDraft: false
           prerelease: false

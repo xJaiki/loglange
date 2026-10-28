@@ -1,6 +1,6 @@
 {
   "name": "loglance",
-  "version": "0.1.0",
+  "version": "26.1.0",
   "packageManager": "pnpm@11.24.0",
   "description": "Loglance — Ultra-Fast Minimalist Real-Time Log Viewer",
   "type": "module",
