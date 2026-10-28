@@ -1,4 +1,4 @@
-# LogViewer ⚡
+# Loglance ⚡
 
 Un visualizzatore di log per desktop (Linux, macOS, Windows) pensato per essere **ultra-veloce, minimale e leggero**.  
 Apre file di log enormi (anche di diversi gigabyte) all'istante e permette di monitorare stream in tempo reale senza rallentare né consumare memoria RAM.
