@@ -96,7 +96,7 @@ jobs:
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || (github.event_name != 'pull_request' && 'v__VERSION__' || '') }}
           releaseName: 'Loglance v__VERSION__'
           releaseBody: 'Automated release build of Loglance.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
 
