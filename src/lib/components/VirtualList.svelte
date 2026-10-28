@@ -1,9 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import type { LogLine } from "$lib/types";
+  import { fly, fade } from "svelte/transition";
+  import { cubicOut } from "svelte/easing";
+  import type { LogLine, SeverityHeatmap } from "$lib/types";
   import Minimap from "$lib/components/Minimap.svelte";
   import { tokenizeLogLine } from "$lib/utils/tokenizer";
   import { logLevelsManager, type StandardLogLevel } from "$lib/stores/logLevels.svelte";
+  import { extractTimestampMs, calculateDelta, type DeltaInfo } from "$lib/utils/timeDelta";
 
   interface Props {
     totalLines: number;
@@ -20,6 +23,15 @@
     onSelectionPause?: () => void;
     onOpenLogLevels?: () => void;
     onQuickMapLevel?: (word: string, level: StandardLogLevel) => void;
+    onFilterInclude?: (text: string) => void;
+    onFilterExclude?: (text: string) => void;
+    onTimeDeltaChange?: (delta: DeltaInfo | null) => void;
+    onToast?: (message: string) => void;
+    onToggleBookmark?: (lineNum: number) => void;
+    onCopySelected?: (withNumbers?: boolean) => void;
+    bookmarks?: number[];
+    heatmap?: SeverityHeatmap | null;
+    wrapLines?: boolean;
     searchQuery?: string;
     isRegex?: boolean;
     caseSensitive?: boolean;
@@ -46,6 +58,15 @@
     onSelectionPause,
     onOpenLogLevels,
     onQuickMapLevel,
+    onFilterInclude,
+    onFilterExclude,
+    onTimeDeltaChange,
+    onToast,
+    onToggleBookmark,
+    onCopySelected,
+    bookmarks = [],
+    heatmap = null,
+    wrapLines = false,
     searchQuery = "",
     isRegex = false,
     caseSensitive = false,
@@ -98,6 +119,9 @@
 
   function handleGlobalMouseUp() {
     if (isDraggingSelection) {
+      if (dragHasMoved) {
+        window.getSelection()?.removeAllRanges();
+      }
       isDraggingSelection = false;
       dragAnchorLine = null;
       setTimeout(() => {
@@ -159,10 +183,57 @@
   let totalContentHeight = $derived(totalLines * itemHeight);
   let startOffsetY = $derived(startIndex * itemHeight);
 
-  // Gutter width calculation based on total digits
+  // Gutter width calculation based on total digits + severity strip + optional T0/bookmark badge
   let gutterWidth = $derived(
-    Math.max(48, `${totalLines}`.length * 9.5 + 24)
+    Math.max(58, `${totalLines}`.length * 9.5 + 38)
   );
+
+  // Time delta anchor state (T0)
+  let timeAnchorLine = $state<LogLine | null>(null);
+
+  // Derived Delta Info between two points in time
+  let activeTimeDelta = $derived.by<DeltaInfo | null>(() => {
+    // 1. If anchor is set: compare anchor line with selectedLine
+    if (timeAnchorLine) {
+      const tAnchor = extractTimestampMs(timeAnchorLine.content);
+      if (tAnchor !== null) {
+        const targetLineNum = selectedLineNumber ?? (selectedLineNumbers?.size ? Array.from(selectedLineNumbers)[0] : null);
+        if (targetLineNum && targetLineNum !== timeAnchorLine.line_number) {
+          const compLine = Array.from(linesMap.values()).find(l => l.line_number === targetLineNum);
+          if (compLine) {
+            const tComp = extractTimestampMs(compLine.content);
+            if (tComp !== null) {
+              return calculateDelta(tAnchor, tComp, timeAnchorLine.line_number, targetLineNum);
+            }
+          }
+        }
+      }
+    }
+
+    // 2. If no anchor, but multiple lines selected: compare min and max selected line
+    if (selectedLineNumbers && selectedLineNumbers.size >= 2) {
+      const sorted = Array.from(selectedLineNumbers).sort((a, b) => a - b);
+      const minLineNum = sorted[0];
+      const maxLineNum = sorted[sorted.length - 1];
+
+      const minLine = Array.from(linesMap.values()).find(l => l.line_number === minLineNum);
+      const maxLine = Array.from(linesMap.values()).find(l => l.line_number === maxLineNum);
+
+      if (minLine && maxLine) {
+        const tMin = extractTimestampMs(minLine.content);
+        const tMax = extractTimestampMs(maxLine.content);
+        if (tMin !== null && tMax !== null) {
+          return calculateDelta(tMin, tMax, minLineNum, maxLineNum);
+        }
+      }
+    }
+
+    return null;
+  });
+
+  $effect(() => {
+    onTimeDeltaChange?.(activeTimeDelta);
+  });
 
   // Pending fetch tracking to avoid redundant concurrent IPC requests
   let pendingFetchRange: { start: number; end: number } | null = null;
@@ -375,6 +446,7 @@
     lineData: LogLine | null;
     rawContent: string;
     targetWord: string | null;
+    selectedText: string | null;
   }
   let contextMenu = $state<ContextMenuState | null>(null);
 
@@ -382,12 +454,20 @@
     e.preventDefault();
     e.stopPropagation();
 
+    // Se la riga cliccata col destro non fa parte delle righe selezionate correnti,
+    // impostiamola come riga selezionata (comportamento standard IDE)
+    if (lineData && (!selectedLineNumbers || !selectedLineNumbers.has(lineData.line_number))) {
+      onLineClick?.(lineData, false, false);
+    }
+
     // Check if user selected some text
     const sel = window.getSelection()?.toString().trim();
     let wordToMap: string | null = null;
+    let selectedText: string | null = null;
 
-    if (sel && sel.length > 0 && sel.length <= 40) {
-      // Clean selected text from brackets/quotes
+    if (sel && sel.length > 0 && sel.length <= 120) {
+      selectedText = sel;
+      // Clean selected text from brackets/quotes for mapping
       wordToMap = sel.replace(/^[\[\("']+|[\]\)"',:;]+$/g, "").trim();
     } else {
       // Try to find a capitalized word or word in brackets from the line
@@ -402,8 +482,8 @@
       }
     }
 
-    const menuWidth = 240;
-    const menuHeight = 260;
+    const menuWidth = 260;
+    const menuHeight = 340;
     const posX = Math.min(e.clientX, window.innerWidth - menuWidth - 10);
     const posY = Math.min(e.clientY, window.innerHeight - menuHeight - 10);
 
@@ -413,6 +493,7 @@
       lineData: lineData ?? null,
       rawContent,
       targetWord: wordToMap && wordToMap.length > 0 ? wordToMap : null,
+      selectedText: selectedText && selectedText.length > 0 ? selectedText : null,
     };
   }
 
@@ -432,8 +513,22 @@
     if (!contextMenu?.rawContent) return;
     try {
       await navigator.clipboard.writeText(contextMenu.rawContent);
+      onToast?.("Riga copiata negli appunti");
     } catch (e) {
       console.error("Errore copia:", e);
+    }
+    closeContextMenu();
+  }
+
+  function handleToggleTimeAnchorFromMenu() {
+    if (!contextMenu?.lineData) return;
+    const line = contextMenu.lineData;
+    if (timeAnchorLine?.line_number === line.line_number) {
+      timeAnchorLine = null;
+      onToast?.("Riferimento Δt (T₀) rimosso");
+    } else {
+      timeAnchorLine = line;
+      onToast?.(`Riferimento Δt (T₀) impostato su riga #${line.line_number}`);
     }
     closeContextMenu();
   }
@@ -459,8 +554,27 @@
     }
 
     function handleGlobalKeydown(e: KeyboardEvent) {
-      if (e.key === "Escape" && contextMenu) {
-        closeContextMenu();
+      if (e.key === "Escape") {
+        if (contextMenu) {
+          closeContextMenu();
+        } else if (timeAnchorLine) {
+          timeAnchorLine = null;
+          onToast?.("Riferimento Δt (T₀) rimosso");
+        }
+      } else if ((e.key === "t" || e.key === "d") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        const target = e.target as HTMLElement;
+        if (target.tagName !== "INPUT" && target.tagName !== "TEXTAREA" && selectedLineNumber) {
+          const line = Array.from(linesMap.values()).find(l => l.line_number === selectedLineNumber);
+          if (line) {
+            if (timeAnchorLine?.line_number === line.line_number) {
+              timeAnchorLine = null;
+              onToast?.("Riferimento Δt (T₀) rimosso");
+            } else {
+              timeAnchorLine = line;
+              onToast?.(`Riferimento Δt (T₀) impostato su riga #${line.line_number}`);
+            }
+          }
+        }
       }
     }
 
@@ -492,7 +606,7 @@
     onscroll={handleScroll}
     onwheel={handleWheel}
     onkeydown={handleKeyDown}
-    class="relative flex-1 h-full overflow-y-auto overflow-x-auto select-text font-mono text-[13px] leading-[24px] outline-none"
+    class="relative flex-1 h-full overflow-y-auto overflow-x-auto {isDraggingSelection ? 'select-none' : 'select-text'} font-mono text-[13px] leading-[24px] outline-none"
     role="region"
     aria-label="Log lines stream"
     tabindex="0"
@@ -539,15 +653,48 @@
                   onLineClick?.(lineData, e.ctrlKey || e.metaKey, e.shiftKey);
                 }
               }}
-              class="flex items-center w-full min-w-max hover:bg-purple-500/[0.09] transition-colors duration-100 border-l-2 border-purple-400/75 bg-purple-500/[0.045] select-none {isFresh ? 'animate-fresh-line' : ''}"
-              style="height: {itemHeight}px; line-height: {itemHeight}px;"
+              class="flex items-center {wrapLines ? 'w-full min-w-full' : 'w-full min-w-max'} hover:bg-purple-500/[0.09] transition-colors duration-100 bg-purple-500/[0.045] select-none {isFresh ? 'animate-fresh-line' : ''}"
+              style={wrapLines ? `min-height: ${itemHeight}px;` : `height: ${itemHeight}px; line-height: ${itemHeight}px;`}
             >
-              <!-- Gutter -->
+              <!-- 1. Gutter Sticky con Severity Strip P0.3 -->
               <div
-                class="shrink-0 text-right pr-3 select-none text-purple-300/75 font-mono text-[11.5px] border-r border-white/[0.08] h-full flex items-center justify-end {isFresh ? 'text-sky-300 font-semibold' : ''}"
+                class="shrink-0 select-none font-mono text-[11.5px] border-r border-white/[0.08] h-full flex items-center sticky left-0 z-10 bg-[#0B0D13] text-purple-300/75 {isFresh ? 'text-sky-300 font-semibold !bg-[#0D1526]' : ''}"
                 style="width: {gutterWidth}px;"
               >
-                {lineNum}
+                <!-- Severity Accent Strip: 3.5px solid/glow purple for stacktrace -->
+                <div
+                  class="w-[3.5px] h-full shrink-0 bg-purple-400 shadow-[0_0_8px_rgba(192,132,252,0.6)]"
+                ></div>
+
+                <!-- Row Number, Bookmark indicator & T0 Anchor Badge -->
+                <div class="flex-1 flex items-center justify-end pr-2.5 gap-1 min-w-0">
+                  {#if bookmarks.includes(lineNum)}
+                    <button
+                      type="button"
+                      onclick={(e) => { e.stopPropagation(); onToggleBookmark?.(lineNum); }}
+                      class="text-cyan-400 hover:text-cyan-200 transition-transform active:scale-90 p-0.5 cursor-pointer leading-none shrink-0"
+                      title="Segnalibro attivo (F2 per saltare, clicca per rimuovere)"
+                    >
+                      <svg class="w-3 h-3 fill-cyan-400 drop-shadow-[0_0_6px_rgba(34,211,238,0.8)]" viewBox="0 0 24 24">
+                        <path d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
+                      </svg>
+                    </button>
+                  {/if}
+
+                  {#if timeAnchorLine && timeAnchorLine.line_number === lineNum}
+                    <span class="px-1 py-0.2 rounded bg-amber-500/30 text-[9px] font-sans font-bold text-amber-200 ring-1 ring-inset ring-amber-400/50 shadow-[0_0_6px_rgba(251,191,36,0.6)] animate-pulse shrink-0">
+                      T₀
+                    </span>
+                  {/if}
+                  <button
+                    type="button"
+                    onclick={(e) => { e.stopPropagation(); onToggleBookmark?.(lineNum); }}
+                    class="cursor-pointer hover:text-cyan-300 transition-colors text-right bg-transparent p-0 border-0 font-mono text-[11px]"
+                    title="Clicca per impostare/rimuovere segnalibro"
+                  >
+                    {lineNum}
+                  </button>
+                </div>
               </div>
 
               <!-- Expandable Pill -->
@@ -596,21 +743,54 @@
               onkeydown={(e) => {
                 if ((e.key === "Enter" || e.key === " ") && lineData) onLineClick?.(lineData, e.ctrlKey || e.metaKey, e.shiftKey);
               }}
-              class="group flex items-center w-full min-w-max cursor-pointer transition-colors duration-75 {isSelected ? '!bg-indigo-500/25 !border-l-2 !border-indigo-400 shadow-[inset_0_1px_0_rgba(129,140,248,0.2)]' : (isFresh ? 'animate-fresh-line ' : '') + parsed.rowTintClass}"
-              style="height: {itemHeight}px; line-height: {itemHeight}px;"
+              class="group flex items-center {wrapLines ? 'w-full min-w-full' : 'w-full min-w-max'} cursor-pointer transition-colors duration-75 {isSelected ? '!bg-indigo-500/25 shadow-[inset_0_1px_0_rgba(129,140,248,0.2)]' : (isFresh ? 'animate-fresh-line ' : '') + parsed.rowTintClass}"
+              style={wrapLines ? `min-height: ${itemHeight}px;` : `height: ${itemHeight}px; line-height: ${itemHeight}px;`}
             >
-              <!-- 1. Colonna Numero Riga (Gutter) -->
+              <!-- 1. Colonna Numero Riga (Gutter) Sticky con Severity Strip P0.3 & Bookmark P1.1 -->
               <div
-                class="shrink-0 text-right pr-3 select-none font-mono text-[11.5px] border-r border-white/[0.08] h-full flex items-center justify-end {isSelected ? 'bg-indigo-500/20 text-indigo-200 font-bold' : isFresh ? 'text-sky-300 font-semibold bg-black/15' : 'text-[#7E879B] group-hover:text-[#B4BCD0] bg-black/15'}"
+                class="shrink-0 select-none font-mono text-[11.5px] border-r border-white/[0.08] h-full flex items-center sticky left-0 z-10 bg-[#0B0D13] {isSelected ? '!bg-[#161B2E] text-indigo-200 font-bold' : isFresh ? 'text-sky-300 font-semibold !bg-[#0D1526]' : 'text-[#7E879B] group-hover:text-[#B4BCD0]'}"
                 style="width: {gutterWidth}px;"
               >
-                {lineNum}
+                <!-- Severity Accent Strip: 3.5px solid high-contrast bar -->
+                <div
+                  class="w-[3.5px] h-full shrink-0 transition-colors duration-100 {isSelected ? 'bg-indigo-400 shadow-[0_0_8px_rgba(129,140,248,0.8)]' : parsed.stripClass}"
+                ></div>
+
+                <!-- Row Number, Bookmark indicator & T0 Anchor Badge -->
+                <div class="flex-1 flex items-center justify-end pr-2.5 gap-1 min-w-0">
+                  {#if bookmarks.includes(lineNum)}
+                    <button
+                      type="button"
+                      onclick={(e) => { e.stopPropagation(); onToggleBookmark?.(lineNum); }}
+                      class="text-cyan-400 hover:text-cyan-200 transition-transform active:scale-90 p-0.5 cursor-pointer leading-none shrink-0"
+                      title="Segnalibro attivo (F2 per saltare, clicca per rimuovere)"
+                    >
+                      <svg class="w-3 h-3 fill-cyan-400 drop-shadow-[0_0_6px_rgba(34,211,238,0.8)]" viewBox="0 0 24 24">
+                        <path d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
+                      </svg>
+                    </button>
+                  {/if}
+
+                  {#if timeAnchorLine && timeAnchorLine.line_number === lineNum}
+                    <span class="px-1 py-0.2 rounded bg-amber-500/30 text-[9px] font-sans font-bold text-amber-200 ring-1 ring-inset ring-amber-400/50 shadow-[0_0_6px_rgba(251,191,36,0.6)] animate-pulse shrink-0">
+                      T₀
+                    </span>
+                  {/if}
+                  <button
+                    type="button"
+                    onclick={(e) => { e.stopPropagation(); onToggleBookmark?.(lineNum); }}
+                    class="cursor-pointer hover:text-cyan-300 transition-colors text-right bg-transparent p-0 border-0 font-mono text-[11px]"
+                    title="Clicca per impostare/rimuovere segnalibro"
+                  >
+                    {lineNum}
+                  </button>
+                </div>
               </div>
 
               <!-- 2. Colonna Timestamp Compatta (Solo per righe non-stacktrace) -->
               {#if !lineData?.is_stacktrace}
                 <div
-                  class="shrink-0 w-[102px] px-2.5 font-mono text-[11.5px] text-[#B4BCD0] group-hover:text-[#E2E8F0] select-text truncate border-r border-white/[0.06] h-full flex items-center"
+                  class="shrink-0 w-[102px] px-2.5 font-mono text-[11.5px] text-[#B4BCD0] group-hover:text-[#E2E8F0] {isDraggingSelection ? 'select-none' : 'select-text'} truncate border-r border-white/[0.06] h-full flex items-center"
                   title={parsed.fullTimestamp ?? ""}
                 >
                   {#if parsed.extractedTimestamp}
@@ -631,7 +811,7 @@
               {/if}
 
               <!-- 4. Colonna Messaggio + Chip Payload -->
-              <div class="px-3.5 whitespace-pre text-[13px] tracking-[-0.005em] font-mono select-text flex items-center h-full {lineData?.is_stacktrace ? 'text-purple-200/85 pl-8 bg-purple-500/[0.025]' : 'text-[#F4F6FB]'} {isFresh ? 'animate-fresh-content' : ''}">
+              <div class="px-3.5 {wrapLines ? 'whitespace-pre-wrap break-all py-1' : 'whitespace-pre'} text-[13px] tracking-[-0.005em] font-mono {isDraggingSelection ? 'select-none' : 'select-text'} flex items-center h-full {lineData?.is_stacktrace ? 'text-purple-200/85 pl-8 bg-purple-500/[0.025]' : 'text-[#F4F6FB]'} {isFresh ? 'animate-fresh-content' : ''}">
                 {#if lineData}
                   <span class="inline-block">{@html parsed.html}</span>
 
@@ -672,26 +852,232 @@
       {visibleStartIndex}
       {visibleCount}
       {matchLines}
+      {bookmarks}
+      {heatmap}
       onSeek={(line) => scrollToIndex(line - 1)}
     />
   {/if}
 
-  <!-- Context Menu Fluttuante per In-Place Mapping & Azioni -->
+  <!-- Floating Time Delta HUD Pill (P0.2) -->
+  {#if activeTimeDelta}
+    <div
+      transition:fly={{ y: 14, duration: 180, easing: cubicOut }}
+      class="absolute bottom-5 left-1/2 -translate-x-1/2 z-30 flex items-center gap-3 px-3.5 py-1.5 rounded-full bg-[#141824]/95 backdrop-blur-xl border border-amber-400/40 shadow-[0_12px_28px_rgba(0,0,0,0.65),0_0_16px_rgba(245,158,11,0.2)] font-sans text-xs text-white select-none"
+    >
+      <div class="flex items-center gap-2">
+        <span class="w-2 h-2 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.9)] animate-pulse"></span>
+        <span class="font-semibold text-amber-200">Δt:</span>
+        <span class="font-mono font-bold text-white tracking-tight">{activeTimeDelta.formatted}</span>
+      </div>
+
+      <div class="w-px h-3.5 bg-white/[0.15]"></div>
+
+      <span class="text-[#B4BCD0] font-mono text-[11px]">
+        #{activeTimeDelta.fromLine} → #{activeTimeDelta.toLine} ({activeTimeDelta.lineCount} {activeTimeDelta.lineCount === 1 ? 'riga' : 'righe'})
+      </span>
+
+      <button
+        onclick={async () => {
+          try {
+            await navigator.clipboard.writeText(activeTimeDelta!.formatted);
+            onToast?.(`Δt copiato: ${activeTimeDelta!.formattedShort}`);
+          } catch {}
+        }}
+        class="px-2 py-0.5 rounded-full bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-[10.5px] font-semibold ring-1 ring-inset ring-amber-400/40 transition active:scale-95 cursor-pointer"
+        title="Copia valore delta negli appunti"
+      >
+        Copia
+      </button>
+
+      {#if timeAnchorLine}
+        <button
+          onclick={() => { timeAnchorLine = null; onToast?.("Riferimento T₀ rimosso"); }}
+          class="text-[#7E879B] hover:text-white transition p-0.5 rounded-full cursor-pointer hover:bg-white/[0.08]"
+          title="Rimuovi riferimento T₀ (Esc)"
+        >
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      {/if}
+    </div>
+  {/if}
+
+  <!-- Context Menu Fluttuante per In-Place Mapping, Filtro Rapido, Delta T0 & Azioni -->
   {#if contextMenu}
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div
       role="menu"
       tabindex="-1"
-      class="fixed z-50 min-w-[210px] bg-[#0E121A]/95 backdrop-blur-md border border-white/[0.12] rounded-xl shadow-2xl p-1.5 text-xs text-[#F4F6FB] animate-scale-up select-none"
+      class="fixed z-50 min-w-[240px] max-w-[320px] bg-[#0E121A]/95 backdrop-blur-md border border-white/[0.14] rounded-xl shadow-[0_16px_40px_rgba(0,0,0,0.7),inset_0_1px_0_rgba(255,255,255,0.12)] p-1.5 text-xs text-[#F4F6FB] animate-scale-up select-none"
       style="left: {contextMenu.x}px; top: {contextMenu.y}px;"
       onclick={(e) => e.stopPropagation()}
     >
+      <!-- Sezione Filtro Rapido / Esclusione (P0.1) -->
+      {#if contextMenu.selectedText || contextMenu.targetWord}
+        {@const filterTerm = contextMenu.selectedText || contextMenu.targetWord || ""}
+        <div class="px-2 py-1 text-[10px] font-semibold text-[#7E879B] uppercase tracking-wider">
+          Filtro Rapido
+        </div>
+
+        <button
+          onclick={() => {
+            if (filterTerm) onFilterInclude?.(filterTerm);
+            closeContextMenu();
+          }}
+          class="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-indigo-500/15 text-[#E2E8F0] hover:text-white transition-colors cursor-pointer text-left group"
+        >
+          <svg class="w-3.5 h-3.5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+          <span class="truncate">Filtra per <span class="font-mono text-indigo-300">"{filterTerm.slice(0, 24)}"</span></span>
+        </button>
+
+        <button
+          onclick={() => {
+            if (filterTerm) onFilterExclude?.(filterTerm);
+            closeContextMenu();
+          }}
+          class="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-rose-500/15 text-rose-300 hover:text-rose-200 transition-colors cursor-pointer text-left group"
+        >
+          <svg class="w-3.5 h-3.5 text-rose-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+          </svg>
+          <span class="truncate">Escludi <span class="font-mono text-rose-200">"{filterTerm.slice(0, 24)}"</span></span>
+        </button>
+
+        <div class="h-px bg-white/[0.08] my-1"></div>
+      {/if}
+
+      <!-- Sezione Copia (Ctrl+C / Ctrl+Shift+C) P0.0 -->
+      <div class="px-2 py-0.5 text-[9.5px] font-semibold text-[#7E879B] uppercase tracking-wider">
+        Appunti
+      </div>
+
+      {#if contextMenu.selectedText}
+        <button
+          onclick={async () => {
+            try {
+              await navigator.clipboard.writeText(contextMenu!.selectedText!);
+              onToast?.(`Testo copiato negli appunti`);
+            } catch {}
+            closeContextMenu();
+          }}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left text-[#B4BCD0] hover:text-white group"
+        >
+          <div class="flex items-center gap-2 truncate">
+            <svg class="w-3.5 h-3.5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+            <span class="truncate">Copia <span class="font-mono text-indigo-200">"{contextMenu.selectedText.slice(0, 16)}"</span></span>
+          </div>
+          <kbd class="text-[9.5px] font-mono px-1 py-0.2 rounded bg-black/30 text-[#B4BCD0]">Ctrl+C</kbd>
+        </button>
+      {/if}
+
+      {#if selectedLineNumbers && selectedLineNumbers.size > 1}
+        <button
+          onclick={() => { closeContextMenu(); onCopySelected?.(false); }}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-indigo-500/15 text-indigo-200 hover:text-white transition-colors cursor-pointer text-left group"
+        >
+          <div class="flex items-center gap-2">
+            <svg class="w-3.5 h-3.5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+            <span>Copia {selectedLineNumbers.size.toLocaleString()} righe</span>
+          </div>
+          <kbd class="text-[9.5px] font-mono px-1 py-0.2 rounded bg-black/30 text-[#B4BCD0]">Ctrl+C</kbd>
+        </button>
+
+        <button
+          onclick={() => { closeContextMenu(); onCopySelected?.(true); }}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left text-[#B4BCD0] hover:text-white group"
+        >
+          <div class="flex items-center gap-2">
+            <svg class="w-3.5 h-3.5 text-[#7E879B] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 20l4-16m2 16l4-16M6 9h14M4 15h14" />
+            </svg>
+            <span>Copia con numeri di riga</span>
+          </div>
+          <kbd class="text-[9.5px] font-mono px-1 py-0.2 rounded bg-black/30 text-[#B4BCD0]">Ctrl+Shift+C</kbd>
+        </button>
+
+        <button
+          onclick={handleCopyLineContent}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left text-[#B4BCD0] hover:text-white group"
+        >
+          <div class="flex items-center gap-2">
+            <svg class="w-3.5 h-3.5 text-[#7E879B] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+            </svg>
+            <span>Copia solo riga #{contextMenu.lineData?.line_number ?? ''}</span>
+          </div>
+        </button>
+      {:else}
+        <button
+          onclick={handleCopyLineContent}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-indigo-500/15 text-indigo-200 hover:text-white transition-colors cursor-pointer text-left group"
+        >
+          <div class="flex items-center gap-2">
+            <svg class="w-3.5 h-3.5 text-indigo-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+            <span>Copia riga intera</span>
+          </div>
+          <kbd class="text-[9.5px] font-mono px-1 py-0.2 rounded bg-black/30 text-[#B4BCD0]">Ctrl+C</kbd>
+        </button>
+
+        <button
+          onclick={() => { closeContextMenu(); onCopySelected?.(true); }}
+          class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left text-[#B4BCD0] hover:text-white group"
+        >
+          <div class="flex items-center gap-2">
+            <svg class="w-3.5 h-3.5 text-[#7E879B] shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 20l4-16m2 16l4-16M6 9h14M4 15h14" />
+            </svg>
+            <span>Copia con numero riga</span>
+          </div>
+          <kbd class="text-[9.5px] font-mono px-1 py-0.2 rounded bg-black/30 text-[#B4BCD0]">Ctrl+Shift+C</kbd>
+        </button>
+      {/if}
+
+      <div class="h-px bg-white/[0.08] my-1"></div>
+
+      <!-- Sezione Delta Temporale T0 (P0.2) -->
+      {#if contextMenu.lineData}
+        {@const line = contextMenu.lineData}
+        {@const isAnchor = timeAnchorLine?.line_number === line.line_number}
+        {@const isBookmarked = bookmarks.includes(line.line_number)}
+        <button
+          onclick={handleToggleTimeAnchorFromMenu}
+          class="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-amber-500/15 text-amber-200 hover:text-amber-100 transition-colors cursor-pointer text-left group"
+        >
+          <span class="text-xs">⏱️</span>
+          <span>{isAnchor ? "Rimuovi riferimento Δt (T₀)" : `Imposta come riferimento Δt (T₀)`}</span>
+          <kbd class="ml-auto text-[9.5px] font-mono px-1 py-0.2 rounded bg-black/30 text-[#B4BCD0]">T</kbd>
+        </button>
+
+        <button
+          onclick={() => {
+            onToggleBookmark?.(line.line_number);
+            closeContextMenu();
+          }}
+          class="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-cyan-500/15 text-cyan-200 hover:text-cyan-100 transition-colors cursor-pointer text-left group"
+        >
+          <svg class="w-3.5 h-3.5 {isBookmarked ? 'fill-cyan-400 text-cyan-400' : 'text-cyan-300'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
+          </svg>
+          <span>{isBookmarked ? "Rimuovi segnalibro" : "Aggiungi segnalibro"}</span>
+          <kbd class="ml-auto text-[9.5px] font-mono px-1 py-0.2 rounded bg-black/30 text-[#B4BCD0]">F2</kbd>
+        </button>
+
+        <div class="h-px bg-white/[0.08] my-1"></div>
+      {/if}
+
       {#if contextMenu.targetWord}
-        <div class="px-2 py-1.5 text-[11px] text-[#7E879B] border-b border-white/[0.08] mb-1 flex items-center gap-1.5 truncate">
-          <span>Mappa</span>
-          <span class="font-mono font-bold text-white max-w-[120px] truncate">"{contextMenu.targetWord}"</span>
-          <span>come:</span>
+        <div class="px-2 py-1 text-[10px] font-semibold text-[#7E879B] uppercase tracking-wider flex items-center gap-1.5 truncate">
+          <span>Mappa "{contextMenu.targetWord.slice(0, 16)}" come:</span>
         </div>
 
         <button
@@ -736,16 +1122,6 @@
 
         <div class="h-px bg-white/[0.08] my-1"></div>
       {/if}
-
-      <button
-        onclick={handleCopyLineContent}
-        class="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors cursor-pointer text-left text-[#B4BCD0] hover:text-white"
-      >
-        <svg class="w-3.5 h-3.5 text-[#7E879B]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-        </svg>
-        <span>Copia riga</span>
-      </button>
 
       <button
         onclick={() => { closeContextMenu(); onOpenLogLevels?.(); }}

@@ -314,6 +314,46 @@ impl LogIndex {
 
         lines
     }
+
+    /// Read raw line contents for a specific sequence of 1-based line numbers.
+    pub fn get_lines_by_numbers(&self, line_numbers: &[usize]) -> Vec<String> {
+        if self.offsets.is_empty() || line_numbers.is_empty() {
+            return Vec::new();
+        }
+
+        let Some(mmap) = self.mmap.as_ref() else {
+            return Vec::new();
+        };
+
+        let total = self.offsets.len();
+        let mut results = Vec::with_capacity(line_numbers.len());
+
+        for &num in line_numbers {
+            if num == 0 || num > total {
+                continue;
+            }
+            let idx = num - 1;
+            let start = self.offsets[idx] as usize;
+            let end = if idx + 1 < total {
+                self.offsets[idx + 1] as usize
+            } else {
+                self.file_size as usize
+            };
+
+            if start <= end && end <= mmap.len() {
+                let mut raw = &mmap[start..end];
+                if raw.ends_with(b"\n") {
+                    raw = &raw[..raw.len() - 1];
+                }
+                if raw.ends_with(b"\r") {
+                    raw = &raw[..raw.len() - 1];
+                }
+                results.push(String::from_utf8_lossy(raw).into_owned());
+            }
+        }
+
+        results
+    }
 }
 
 #[cfg(test)]
@@ -444,6 +484,24 @@ mod tests {
         assert_eq!(index.find_timestamp_line("11:45:00"), Some(3));
         assert_eq!(index.find_timestamp_line("10:00:00"), Some(1));
         assert_eq!(index.find_timestamp_line("23:59:59"), None);
+    }
+
+    #[test]
+    fn test_get_lines_by_numbers() {
+        let mut temp = NamedTempFile::new().unwrap();
+        writeln!(temp, "Line 1: Alpha").unwrap();
+        writeln!(temp, "Line 2: Beta").unwrap();
+        writeln!(temp, "Line 3: Gamma").unwrap();
+        writeln!(temp, "Line 4: Delta").unwrap();
+        temp.flush().unwrap();
+
+        let (index, _) = LogIndex::open(temp.path()).unwrap();
+        let selected = index.get_lines_by_numbers(&[1, 3, 4]);
+        assert_eq!(selected, vec!["Line 1: Alpha", "Line 3: Gamma", "Line 4: Delta"]);
+
+        // Out of bounds or 0
+        let oob = index.get_lines_by_numbers(&[0, 2, 99]);
+        assert_eq!(oob, vec!["Line 2: Beta"]);
     }
 
     #[test]

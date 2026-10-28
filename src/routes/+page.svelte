@@ -4,7 +4,7 @@
   import { cubicOut } from "svelte/easing";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import VirtualList from "$lib/components/VirtualList.svelte";
   import FilterBar from "$lib/components/FilterBar.svelte";
@@ -12,6 +12,8 @@
   import CommandPalette from "$lib/components/CommandPalette.svelte";
   import TabBar from "$lib/components/TabBar.svelte";
   import LogLevelsModal from "$lib/components/LogLevelsModal.svelte";
+  import TimelineHistogram from "$lib/components/TimelineHistogram.svelte";
+  import ViewMenu from "$lib/components/ViewMenu.svelte";
   import { logLevelsManager } from "$lib/stores/logLevels.svelte";
   import type {
     FileOpenResult,
@@ -21,8 +23,12 @@
     LogLine,
     LogTab,
     SearchDisplayMode,
-    SearchResult
+    SearchResult,
+    SeverityHeatmap,
+    TimeHistogram,
+    TimelineBrushRange
   } from "$lib/types";
+  import type { DeltaInfo } from "$lib/utils/timeDelta";
 
   // Multi-tab state
   let tabs = $state<LogTab[]>([]);
@@ -53,6 +59,7 @@
   let searchQuery = $derived(activeTab ? activeTab.searchQuery : "");
   let isRegex = $derived(activeTab ? activeTab.isRegex : false);
   let caseSensitive = $derived(activeTab ? activeTab.caseSensitive : false);
+  let invert = $derived(activeTab ? activeTab.invert : false);
   let searchMode = $derived<SearchDisplayMode>(activeTab ? activeTab.searchMode : "filter");
   let totalMatches = $derived(activeTab ? activeTab.totalMatches : 0);
   let searchTimeMs = $derived(activeTab ? activeTab.searchTimeMs : 0);
@@ -62,6 +69,13 @@
   let searchError = $derived<string | null>(activeTab ? activeTab.searchError : null);
   let selectedLine = $derived<LogLine | null>(activeTab ? activeTab.selectedLine : null);
   let selectedLineNumbers = $derived<Set<number>>(activeTab ? activeTab.selectedLineNumbers : new Set<number>());
+  let wrapLines = $derived(activeTab ? activeTab.wrapLines : false);
+  let bookmarks = $derived<number[]>(activeTab ? activeTab.bookmarks : []);
+  let isTimelineOpen = $derived<boolean>(Boolean(activeTab && activeTab.isTimelineOpen));
+  let timelineHistogram = $state<TimeHistogram | null>(null);
+  let isTimelineLoading = $state(false);
+  let currentHeatmap = $state<SeverityHeatmap | null>(null);
+  let currentTimeDelta = $state<DeltaInfo | null>(null);
   let foldingStatus = $derived<FoldingStatus>(
     activeTab
       ? activeTab.foldingStatus
@@ -125,6 +139,7 @@
     }
     activeTab.searchMode = "filter";
     activeTab.caseSensitive = false;
+    activeTab.invert = false;
     if (preset === "errors") {
       activeTab.isRegex = true;
       activeTab.searchQuery = logLevelsManager.getFilterRegex("ERROR");
@@ -224,6 +239,16 @@
       if (activeTabId === tabId && target) target.foldingStatus = status;
     });
 
+    timelineHistogram = target.timelineHistogram ?? null;
+    if (target.isTimelineOpen && !target.timelineHistogram) {
+      fetchTimeline(target);
+    }
+
+    currentHeatmap = target.heatmap ?? null;
+    if (!target.heatmap) {
+      fetchHeatmap(target);
+    }
+
     virtualListRef?.clearCache();
 
     requestAnimationFrame(() => {
@@ -296,6 +321,7 @@
         searchQuery: "",
         isRegex: false,
         caseSensitive: false,
+        invert: false,
         searchMode: "filter",
         totalMatches: 0,
         searchTimeMs: 0,
@@ -306,11 +332,24 @@
         foldingStatus: fStatus,
         selectedLine: null,
         selectedLineNumbers: new Set<number>(),
-        lastAnchorLineNum: null
+        lastAnchorLineNum: null,
+        wrapLines: localStorage.getItem("logviewer:wrapLines") === "true",
+        bookmarks: [],
+        isTimelineOpen: localStorage.getItem("logviewer:isTimelineOpen") === "true",
+        timelineHistogram: null,
+        heatmap: null
       };
 
       tabs = [...tabs, newTab];
       activeTabId = newTab.id;
+      timelineHistogram = null;
+      currentHeatmap = null;
+
+      fetchHeatmap(newTab);
+
+      if (newTab.isTimelineOpen) {
+        fetchTimeline(newTab);
+      }
 
       virtualListRef?.clearCache();
       requestAnimationFrame(() => {
@@ -636,6 +675,9 @@
       case "toggle_case":
         handleToggleCase();
         break;
+      case "toggle_invert":
+        handleToggleInvert();
+        break;
       case "clear_filter":
         clearSearch();
         break;
@@ -679,6 +721,43 @@
       case "configure_log_levels":
         isLogLevelsModalOpen = true;
         break;
+      case "toggle_wrap":
+        toggleWrapLines();
+        break;
+      case "toggle_bookmark":
+        if (selectedLine) {
+          toggleBookmark(selectedLine.line_number);
+        } else {
+          showToast("Seleziona prima una riga da contrassegnare (Ctrl+B)");
+        }
+        break;
+      case "next_bookmark":
+        jumpToNextBookmark();
+        break;
+      case "prev_bookmark":
+        jumpToPrevBookmark();
+        break;
+      case "clear_all_bookmarks":
+        clearAllBookmarks();
+        break;
+      case "toggle_timeline":
+        toggleTimeline();
+        break;
+      case "export_filtered":
+        handleExportFilteredLines();
+        break;
+      case "copy_filtered":
+        handleCopyAllFilteredLines();
+        break;
+      case "copy_selected_lines":
+        copySelectedLines(false);
+        break;
+      case "copy_selected_lines_with_numbers":
+        copySelectedLines(true);
+        break;
+      case "select_all_lines":
+        handleSelectAllLines();
+        break;
     }
   }
 
@@ -712,7 +791,7 @@
           query: activeTab.searchQuery,
           is_regex: activeTab.isRegex,
           case_sensitive: activeTab.caseSensitive,
-          invert: false
+          invert: activeTab.invert
         }
       });
 
@@ -735,6 +814,10 @@
           activeTab.currentMatchIndex = 0;
           activeTab.currentMatchLine = null;
         }
+
+        if (activeTab.isTimelineOpen) {
+          fetchTimeline(activeTab, true);
+        }
       }
     } catch (err: any) {
       const errStr = typeof err === "string" ? err : err?.message || "Search failed";
@@ -750,6 +833,7 @@
     if (!activeTab) return;
     const tabId = activeTab.id;
     activeTab.searchQuery = "";
+    activeTab.invert = false;
     activeTab.totalMatches = 0;
     activeTab.searchTimeMs = 0;
     activeTab.matchLines = [];
@@ -761,13 +845,49 @@
     } catch (e) {
       console.warn("Failed to clear search:", e);
     }
+    if (activeTab.isTimelineOpen) {
+      fetchTimeline(activeTab, false);
+    }
     virtualListRef?.clearCache();
   }
 
   function handleSearchQueryChange(newQuery: string) {
     if (!activeTab) return;
+    if (newQuery.startsWith("!") && newQuery.length > 1 && !activeTab.isRegex && !activeTab.invert) {
+      activeTab.invert = true;
+      activeTab.searchQuery = newQuery.slice(1);
+      scheduleSearch();
+      return;
+    }
     activeTab.searchQuery = newQuery;
     scheduleSearch();
+  }
+
+  function handleToggleInvert() {
+    if (!activeTab) return;
+    activeTab.invert = !activeTab.invert;
+    showToast(activeTab.invert ? "Filtro inverso (esclusione) attivato" : "Filtro normale (inclusione) attivato");
+    scheduleSearch(true);
+  }
+
+  function handleFilterInclude(text: string) {
+    if (!activeTab) return;
+    activeTab.searchQuery = text;
+    activeTab.isRegex = false;
+    activeTab.invert = false;
+    activeTab.searchMode = "filter";
+    showToast(`Filtro attivo per: "${text.slice(0, 30)}"`);
+    scheduleSearch(true);
+  }
+
+  function handleFilterExclude(text: string) {
+    if (!activeTab) return;
+    activeTab.searchQuery = text;
+    activeTab.isRegex = false;
+    activeTab.invert = true;
+    activeTab.searchMode = "filter";
+    showToast(`Esclusione attiva per: "${text.slice(0, 30)}"`);
+    scheduleSearch(true);
   }
 
   function handleToggleRegex() {
@@ -852,6 +972,292 @@
     }
   }
 
+  // --- P1 Features: Bookmarks, Word Wrap, Export ---
+
+  function toggleBookmark(lineNum: number) {
+    if (!activeTab) return;
+    const exists = activeTab.bookmarks.includes(lineNum);
+    if (exists) {
+      activeTab.bookmarks = activeTab.bookmarks.filter((n) => n !== lineNum);
+      showToast(`Segnalibro rimosso dalla riga #${lineNum}`);
+    } else {
+      activeTab.bookmarks = [...activeTab.bookmarks, lineNum].sort((a, b) => a - b);
+      showToast(`Segnalibro aggiunto alla riga #${lineNum}`);
+    }
+  }
+
+  async function jumpToNextBookmark() {
+    if (!activeTab || activeTab.bookmarks.length === 0) {
+      showToast("Nessun segnalibro salvato");
+      return;
+    }
+    const curLine = selectedLine?.line_number ?? 0;
+    const next = activeTab.bookmarks.find((b) => b > curLine) ?? activeTab.bookmarks[0];
+    try {
+      const displayRow = await invoke<number>("map_line_to_display_row", {
+        tabId: activeTab.id,
+        lineNumber: next
+      });
+      pauseLive();
+      virtualListRef?.scrollToIndex(displayRow, true);
+      const line = virtualListRef?.getLineByNumber(next);
+      if (line) {
+        activeTab.selectedLine = line;
+        activeTab.selectedLineNumbers = new Set([next]);
+      }
+      showToast(`Segnalibro: riga #${next} (${activeTab.bookmarks.indexOf(next) + 1}/${activeTab.bookmarks.length})`);
+    } catch (e) {
+      console.warn("Failed to jump to bookmark:", e);
+    }
+  }
+
+  async function jumpToPrevBookmark() {
+    if (!activeTab || activeTab.bookmarks.length === 0) {
+      showToast("Nessun segnalibro salvato");
+      return;
+    }
+    const curLine = selectedLine?.line_number ?? (totalLines + 1);
+    const rev = [...activeTab.bookmarks].reverse();
+    const prev = rev.find((b) => b < curLine) ?? rev[0];
+    try {
+      const displayRow = await invoke<number>("map_line_to_display_row", {
+        tabId: activeTab.id,
+        lineNumber: prev
+      });
+      pauseLive();
+      virtualListRef?.scrollToIndex(displayRow, true);
+      const line = virtualListRef?.getLineByNumber(prev);
+      if (line) {
+        activeTab.selectedLine = line;
+        activeTab.selectedLineNumbers = new Set([prev]);
+      }
+      showToast(`Segnalibro: riga #${prev} (${activeTab.bookmarks.indexOf(prev) + 1}/${activeTab.bookmarks.length})`);
+    } catch (e) {
+      console.warn("Failed to jump to bookmark:", e);
+    }
+  }
+
+  function clearAllBookmarks() {
+    if (!activeTab) return;
+    activeTab.bookmarks = [];
+    showToast("Tutti i segnalibri sono stati rimossi");
+  }
+
+  function toggleWrapLines() {
+    if (!activeTab) return;
+    activeTab.wrapLines = !activeTab.wrapLines;
+    try {
+      localStorage.setItem("logviewer:wrapLines", String(activeTab.wrapLines));
+    } catch {}
+    showToast(`A capo automatico (Word Wrap): ${activeTab.wrapLines ? "attivato" : "disattivato"}`);
+  }
+
+  async function handleExportFilteredLines() {
+    if (!activeTab) return;
+    if (totalMatches === 0) {
+      showToast("Nessuna riga filtrata da esportare");
+      return;
+    }
+
+    try {
+      const baseName = activeTab.fileName.replace(/\.[^/.]+$/, "");
+      const defaultName = `${baseName}-filtered.log`;
+      const savePath = await saveDialog({
+        defaultPath: defaultName,
+        filters: [
+          { name: "File di Log", extensions: ["log", "txt", "out"] },
+          { name: "Tutti i File", extensions: ["*"] }
+        ]
+      });
+
+      if (!savePath) return;
+
+      const count = await invoke<number>("export_filtered_lines", {
+        tabId: activeTab.id,
+        destPath: savePath
+      });
+      const fileOnly = savePath.split(/[\/\\]/).pop() ?? "file";
+      showToast(`Esportate ${count.toLocaleString()} righe in ${fileOnly}`);
+    } catch (err: any) {
+      console.error("Export error:", err);
+      showToast("Errore esportazione: " + (err?.message || err));
+    }
+  }
+
+  async function copySelectedLines(withLineNumbers: boolean = false): Promise<boolean> {
+    if (!activeTab) return false;
+
+    let lineNumbers: number[] = [];
+    if (activeTab.selectedLineNumbers && activeTab.selectedLineNumbers.size > 0) {
+      lineNumbers = Array.from(activeTab.selectedLineNumbers).sort((a, b) => a - b);
+    } else if (activeTab.selectedLine) {
+      lineNumbers = [activeTab.selectedLine.line_number];
+    }
+
+    if (lineNumbers.length === 0) {
+      showToast("Nessuna riga selezionata");
+      return false;
+    }
+
+    try {
+      let content = "";
+      // Fast path: riga singola già disponibile in activeTab.selectedLine
+      if (
+        lineNumbers.length === 1 &&
+        activeTab.selectedLine &&
+        activeTab.selectedLine.line_number === lineNumbers[0]
+      ) {
+        content = withLineNumbers
+          ? `${lineNumbers[0]}: ${activeTab.selectedLine.content}`
+          : activeTab.selectedLine.content;
+      } else {
+        // Fast path: recupero ultra-rapido da mmap Rust senza dipendere dalla cache viewport
+        content = await invoke<string>("get_lines_content", {
+          tabId: activeTab.id,
+          lineNumbers,
+          withLineNumbers
+        });
+      }
+
+      await navigator.clipboard.writeText(content);
+
+      if (lineNumbers.length === 1) {
+        showToast(
+          withLineNumbers
+            ? `Riga #${lineNumbers[0]} copiata (con numero)`
+            : `Riga #${lineNumbers[0]} copiata negli appunti`
+        );
+      } else {
+        showToast(
+          withLineNumbers
+            ? `${lineNumbers.length.toLocaleString()} righe copiate (con numeri)`
+            : `${lineNumbers.length.toLocaleString()} righe copiate negli appunti`
+        );
+      }
+      return true;
+    } catch (err: any) {
+      console.error("Errore copia righe:", err);
+      showToast("Errore durante la copia negli appunti");
+      return false;
+    }
+  }
+
+  function handleSelectAllLines() {
+    if (!activeTab || effectiveTotalLines <= 0) return;
+    const MAX_SELECT = 20_000;
+    const countToSelect = Math.min(effectiveTotalLines, MAX_SELECT);
+    const nextSet = new Set<number>();
+    for (let i = 1; i <= countToSelect; i++) {
+      nextSet.add(i);
+    }
+    activeTab.selectedLineNumbers = nextSet;
+    if (effectiveTotalLines > MAX_SELECT) {
+      showToast(`Selezionate le prime ${MAX_SELECT.toLocaleString()} righe (file molto grande, usa Ctrl+K per esportare tutto)`);
+    } else {
+      showToast(`Tutte le ${countToSelect.toLocaleString()} righe selezionate (Ctrl+C per copiare)`);
+    }
+  }
+
+  async function handleCopyAllFilteredLines() {
+    if (!activeTab || totalMatches === 0) return;
+    try {
+      const content = await invoke<string>("get_filtered_content", {
+        tabId: activeTab.id,
+        maxLines: 5000
+      });
+      await navigator.clipboard.writeText(content);
+      const lineCount = content.split("\n").filter(Boolean).length;
+      showToast(`${lineCount.toLocaleString()} righe filtrate copiate negli appunti`);
+    } catch (err: any) {
+      showToast("Errore durante la copia delle righe filtrate");
+    }
+  }
+
+  // --- P2 Timeline & Temporal Histogram Functions ---
+
+  async function fetchTimeline(targetTab?: LogTab | null, forceFiltered?: boolean) {
+    const tab = targetTab ?? activeTab;
+    if (!tab) return;
+    isTimelineLoading = true;
+    try {
+      const isFiltered = forceFiltered !== undefined ? forceFiltered : Boolean(tab.searchQuery.trim().length > 0 && tab.searchMode === "filter");
+      const hist = await invoke<TimeHistogram>("get_time_histogram", {
+        tabId: tab.id,
+        bucketCount: 80,
+        filtered: isFiltered
+      });
+      tab.timelineHistogram = hist;
+      if (activeTab && activeTab.id === tab.id) {
+        timelineHistogram = hist;
+      }
+    } catch (err) {
+      console.warn("Failed to load timeline histogram:", err);
+    } finally {
+      isTimelineLoading = false;
+    }
+  }
+
+  async function fetchHeatmap(targetTab?: LogTab | null) {
+    const tab = targetTab ?? activeTab;
+    if (!tab) return;
+    try {
+      const errorKeywords = logLevelsManager.levels.ERROR?.keywords || [];
+      const warnKeywords = logLevelsManager.levels.WARN?.keywords || [];
+
+      const res = await invoke<SeverityHeatmap>("get_severity_heatmap", {
+        tabId: tab.id,
+        numBins: 250,
+        customErrorKeywords: errorKeywords,
+        customWarnKeywords: warnKeywords
+      });
+      tab.heatmap = res;
+      if (activeTab && activeTab.id === tab.id) {
+        currentHeatmap = res;
+      }
+    } catch (err) {
+      console.warn("Failed to fetch severity heatmap:", err);
+    }
+  }
+
+  function toggleTimeline() {
+    if (!activeTab) return;
+    activeTab.isTimelineOpen = !activeTab.isTimelineOpen;
+    try {
+      localStorage.setItem("logviewer:isTimelineOpen", String(activeTab.isTimelineOpen));
+    } catch {}
+
+    if (activeTab.isTimelineOpen) {
+      if (!timelineHistogram) {
+        fetchTimeline(activeTab);
+      }
+    }
+    showToast(`Timeline temporale: ${activeTab.isTimelineOpen ? "aperta" : "chiusa"}`);
+  }
+
+  async function handleTimelineSelectLine(lineNum: number) {
+    if (!activeTab || lineNum <= 0) return;
+    if (isLive) pauseLive();
+
+    try {
+      const displayRow = await invoke<number>("map_line_to_display_row", {
+        tabId: activeTab.id,
+        lineNumber: lineNum
+      });
+      virtualListRef?.scrollToIndex(displayRow - 1);
+    } catch {
+      virtualListRef?.scrollToIndex(lineNum - 1);
+    }
+  }
+
+  function handleTimelineFilterTimeRange(range: TimelineBrushRange) {
+    if (!activeTab) return;
+    if (activeTab.timelineHistogram?.buckets[range.startIndex]) {
+      const startBucket = activeTab.timelineHistogram.buckets[range.startIndex];
+      handleSearchQueryChange(startBucket.label);
+      showToast(`Filtro applicato su intervallo: ${startBucket.label}`);
+    }
+  }
+
   function isInputFocused(target: EventTarget | null): boolean {
     if (!target || !(target instanceof HTMLElement)) return false;
     const tag = target.tagName.toLowerCase();
@@ -924,6 +1330,102 @@
       return;
     }
 
+    // Toggle Invert / Negative Filter: Alt + I
+    if (e.altKey && e.key.toLowerCase() === "i") {
+      e.preventDefault();
+      handleToggleInvert();
+      return;
+    }
+
+    // Toggle Word Wrap: Alt + Z
+    if (e.altKey && e.key.toLowerCase() === "z") {
+      e.preventDefault();
+      toggleWrapLines();
+      return;
+    }
+
+    // Toggle Timeline / Time Histogram: Alt + T
+    if (e.altKey && e.key.toLowerCase() === "t") {
+      e.preventDefault();
+      toggleTimeline();
+      return;
+    }
+
+    // Bookmark navigation: F2 (next) and Shift+F2 (prev)
+    if (e.key === "F2" && !isInputFocused(e.target)) {
+      e.preventDefault();
+      if (e.shiftKey) {
+        jumpToPrevBookmark();
+      } else {
+        jumpToNextBookmark();
+      }
+      return;
+    }
+
+    // Toggle Bookmark on selected line: Cmd/Ctrl + B
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b" && !isInputFocused(e.target)) {
+      e.preventDefault();
+      if (selectedLine) {
+        toggleBookmark(selectedLine.line_number);
+      } else {
+        showToast("Seleziona una riga per aggiungere un segnalibro (Ctrl+B)");
+      }
+      return;
+    }
+
+    // Copy selected lines with line numbers: Cmd/Ctrl + Shift + C
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "c" && !isInputFocused(e.target)) {
+      if ((activeTab?.selectedLineNumbers && activeTab.selectedLineNumbers.size > 0) || activeTab?.selectedLine) {
+        e.preventDefault();
+        copySelectedLines(true);
+        return;
+      }
+    }
+
+    // Copy selected lines: Cmd/Ctrl + C
+    if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key.toLowerCase() === "c" && !isInputFocused(e.target)) {
+      const hasMultiRowSelection = Boolean(activeTab?.selectedLineNumbers && activeTab.selectedLineNumbers.size > 1);
+
+      // Se l'utente ha selezionato più righe (tramite drag, Shift+Click o Ctrl+Click),
+      // la selezione multi-riga ha SEMPRE la precedenza assoluta!
+      if (hasMultiRowSelection) {
+        e.preventDefault();
+        window.getSelection()?.removeAllRanges();
+        copySelectedLines(false);
+        return;
+      }
+
+      // Se l'utente ha evidenziato intenzionalmente uno snippet di testo nel DOM
+      const activeTextSel = window.getSelection()?.toString();
+      if (activeTextSel && activeTextSel.trim().length > 0) {
+        return; // Lascia copiare nativamente al browser lo snippet di testo evidenziato
+      }
+
+      // Altrimenti copia la riga selezionata
+      if (
+        (activeTab?.selectedLineNumbers && activeTab.selectedLineNumbers.size > 0) ||
+        activeTab?.selectedLine
+      ) {
+        e.preventDefault();
+        copySelectedLines(false);
+        return;
+      }
+    }
+
+    // Select all lines: Cmd/Ctrl + A (when not editing an input/textarea)
+    if (
+      (e.metaKey || e.ctrlKey) &&
+      e.key.toLowerCase() === "a" &&
+      !isInputFocused(e.target) &&
+      !isDrawerOpen &&
+      !isCommandPaletteOpen &&
+      !isLogLevelsModalOpen
+    ) {
+      e.preventDefault();
+      handleSelectAllLines();
+      return;
+    }
+
     // Quick filter focus: Vim-style "/" or Cmd/Ctrl + F
     if ((e.key === "/" && !isInputFocused(e.target)) || ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f")) {
       e.preventDefault();
@@ -957,6 +1459,30 @@
 
   onMount(() => {
     window.addEventListener("keydown", handleKeydown);
+
+    function handleGlobalCopy(e: ClipboardEvent) {
+      if (isInputFocused(document.activeElement)) return;
+      const hasMultiRowSelection = Boolean(activeTab?.selectedLineNumbers && activeTab.selectedLineNumbers.size > 1);
+
+      if (hasMultiRowSelection) {
+        e.preventDefault();
+        window.getSelection()?.removeAllRanges();
+        copySelectedLines(false);
+        return;
+      }
+
+      const sel = window.getSelection()?.toString();
+      if (sel && sel.trim().length > 0) return;
+      if (
+        (activeTab?.selectedLineNumbers && activeTab.selectedLineNumbers.size > 0) ||
+        activeTab?.selectedLine
+      ) {
+        e.preventDefault();
+        copySelectedLines(false);
+      }
+    }
+
+    window.addEventListener("copy", handleGlobalCopy);
 
     try {
       const savedAnim = localStorage.getItem("logviewer:liveAnimations");
@@ -1054,6 +1580,12 @@
           virtualListRef?.invalidateFromLine(Math.max(1, oldTotal));
         }
 
+        if (targetTab.isTimelineOpen) {
+          fetchTimeline(targetTab);
+        }
+
+        fetchHeatmap(targetTab);
+
         if (targetTab.isLive) {
           requestAnimationFrame(() => {
             virtualListRef?.scrollToBottom(false);
@@ -1094,6 +1626,7 @@
 
     return () => {
       window.removeEventListener("keydown", handleKeydown);
+      window.removeEventListener("copy", handleGlobalCopy);
       if (unlistenAppend) unlistenAppend();
       if (unlistenFilter) unlistenFilter();
       if (unlistenDragDrop) unlistenDragDrop();
@@ -1158,12 +1691,13 @@
 
     <!-- 2. Centro: Search & Filter Bar Integrata (per tab attivo) -->
     {#if activeTab}
-      <div class="flex-1 flex justify-center min-w-[220px] max-w-xl">
+      <div class="flex-1 flex justify-center min-w-[220px] max-w-2xl">
         <FilterBar
           bind:this={filterBarRef}
           query={searchQuery}
           {isRegex}
           {caseSensitive}
+          {invert}
           mode={searchMode}
           {totalMatches}
           {totalLines}
@@ -1171,76 +1705,70 @@
           {currentMatchIndex}
           error={searchError}
           isLoading={isSearching}
+          quickPreset={activeQuickPreset}
+          canExport={isFilterActive && totalMatches > 0}
           onSearchChange={handleSearchQueryChange}
           onToggleRegex={handleToggleRegex}
           onToggleCase={handleToggleCase}
+          onToggleInvert={handleToggleInvert}
           onModeChange={handleModeChange}
           onNextMatch={handleNextMatch}
           onPrevMatch={handlePrevMatch}
           onClear={clearSearch}
+          onApplyQuickPreset={applyQuickPreset}
+          onExport={handleExportFilteredLines}
+          onCopy={handleCopyAllFilteredLines}
         />
       </div>
     {/if}
 
-    <!-- 3. Destra: Quick Filters + Azioni Globali -->
+    <!-- 3. Destra: Segnalibri, Menu Vista & Azioni Globali -->
     <div class="flex items-center gap-2 shrink-0">
       {#if activeTab}
-        <!-- Quick Filter Pills -->
-        <div class="hidden lg:flex items-center gap-1 bg-[#0B0D13]/90 p-1 rounded-xl ring-1 ring-inset ring-white/[0.09]">
-          <button
-            onclick={() => applyQuickPreset("all")}
-            class="px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all duration-150 active:scale-95 cursor-pointer {activeQuickPreset === 'all' ? 'bg-indigo-500/25 text-indigo-200 ring-1 ring-inset ring-indigo-400/45 shadow-xs' : 'text-[#B4BCD0] hover:text-white'}"
-          >
-            All
-          </button>
-          <button
-            onclick={() => applyQuickPreset("errors")}
-            class="px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all duration-150 active:scale-95 cursor-pointer flex items-center gap-1.5 {activeQuickPreset === 'errors' ? 'bg-rose-500/25 text-rose-200 ring-1 ring-inset ring-rose-400/45 shadow-xs' : 'text-[#B4BCD0] hover:text-white'}"
-          >
-            <span class="w-1.5 h-1.5 rounded-full bg-rose-400 shadow-[0_0_6px_rgba(251,113,133,0.8)]"></span>
-            <span>Errors</span>
-          </button>
-          <button
-            onclick={() => applyQuickPreset("warnings")}
-            class="px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all duration-150 active:scale-95 cursor-pointer flex items-center gap-1.5 {activeQuickPreset === 'warnings' ? 'bg-amber-500/25 text-amber-200 ring-1 ring-inset ring-amber-400/45 shadow-xs' : 'text-[#B4BCD0] hover:text-white'}"
-          >
-            <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.8)]"></span>
-            <span>Warnings</span>
-          </button>
-          <button
-            onclick={() => applyQuickPreset("json")}
-            class="px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all duration-150 active:scale-95 cursor-pointer flex items-center gap-1 {activeQuickPreset === 'json' ? 'bg-emerald-500/25 text-emerald-200 ring-1 ring-inset ring-emerald-400/45 shadow-xs' : 'text-[#B4BCD0] hover:text-white'}"
-          >
-            <span class="font-mono text-[10px] text-emerald-300 font-bold">&#123;&#125;</span>
-            <span>JSON</span>
-          </button>
-          <div class="w-px h-3.5 bg-white/[0.1] my-auto mx-0.5"></div>
-          <button
-            onclick={() => (isLogLevelsModalOpen = true)}
-            class="px-2 py-1 rounded-lg text-[11px] font-medium transition-all duration-150 active:scale-95 cursor-pointer text-[#7E879B] hover:text-white hover:bg-white/[0.06] flex items-center gap-1"
-            title="Personalizza parole chiave dei livelli (Error, Warning, Info...)"
-          >
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
-            </svg>
-            <span class="hidden xl:inline">Livelli</span>
-          </button>
-        </div>
-
-        {#if foldingStatus.total_groups > 0}
-          <button
-            onclick={toggleAutoCollapseStacktraces}
-            class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium transition-all duration-150 active:scale-95 cursor-pointer {foldingStatus.auto_collapse_enabled ? 'bg-purple-500/20 text-purple-200 ring-1 ring-inset ring-purple-400/40 hover:bg-purple-500/30' : 'tactile-button text-[#B4BCD0] hover:text-white'}"
-            title="Attiva/Disattiva raggruppamento stacktrace (Alt + S)"
-          >
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-            </svg>
-            <span class="hidden sm:inline">
-              {foldingStatus.auto_collapse_enabled ? `Stack (${foldingStatus.total_groups})` : "Expand"}
-            </span>
-          </button>
+        <!-- Bookmarks Pill (solo se ci sono segnalibri) -->
+        {#if bookmarks.length > 0}
+          <div class="flex items-center rounded-lg bg-cyan-950/40 border border-cyan-500/30 text-cyan-200 text-xs overflow-hidden shadow-xs">
+            <button
+              onclick={jumpToPrevBookmark}
+              class="px-1.5 py-1 hover:bg-cyan-500/20 text-cyan-300 transition-colors cursor-pointer border-r border-cyan-500/20"
+              title="Segnalibro precedente (Shift + F2)"
+            >
+              <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M5 15l7-7 7 7" />
+              </svg>
+            </button>
+            <button
+              onclick={jumpToNextBookmark}
+              class="px-2 py-1 flex items-center gap-1 hover:bg-cyan-500/20 text-cyan-200 transition-colors cursor-pointer font-medium text-[11px]"
+              title="Segnalibro successivo (F2)"
+            >
+              <svg class="w-3 h-3 fill-cyan-400 text-cyan-400" viewBox="0 0 24 24">
+                <path d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
+              </svg>
+              <span>{bookmarks.length}</span>
+            </button>
+            <button
+              onclick={jumpToNextBookmark}
+              class="px-1.5 py-1 hover:bg-cyan-500/20 text-cyan-300 transition-colors cursor-pointer border-l border-cyan-500/20"
+              title="Segnalibro successivo (F2)"
+            >
+              <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+          </div>
         {/if}
+
+        <!-- Menu Unificato "Vista" (A capo, Timeline, Stacktrace, Livelli) -->
+        <ViewMenu
+          {wrapLines}
+          onToggleWrap={toggleWrapLines}
+          {isTimelineOpen}
+          onToggleTimeline={toggleTimeline}
+          {foldingStatus}
+          onToggleFolding={toggleAutoCollapseStacktraces}
+          onOpenLogLevels={() => (isLogLevelsModalOpen = true)}
+        />
       {/if}
 
       <button
@@ -1292,6 +1820,18 @@
     </div>
   {/if}
 
+  <!-- Zona 1.7: Timeline / Istogramma Temporale con Brushing -->
+  {#if activeTab && isTimelineOpen}
+    <TimelineHistogram
+      histogram={timelineHistogram}
+      isLoading={isTimelineLoading}
+      {isFilterActive}
+      onSelectLine={handleTimelineSelectLine}
+      onFilterTimeRange={handleTimelineFilterTimeRange}
+      onClose={toggleTimeline}
+    />
+  {/if}
+
   <!-- Main Canvas -->
   <main class="relative flex-1 w-full h-full overflow-hidden bg-[#0B0D13] flex flex-row">
     <!-- Colonna sinistra: Canvas principale con stream log -->
@@ -1308,6 +1848,10 @@
           searchQuery={searchQuery}
           {isRegex}
           {caseSensitive}
+          wrapLines={wrapLines}
+          bookmarks={bookmarks}
+          heatmap={currentHeatmap}
+          onToggleBookmark={toggleBookmark}
           activeMatchLine={currentMatchLine}
           selectedLineNumber={selectedLine ? selectedLine.line_number : null}
           {selectedLineNumbers}
@@ -1316,10 +1860,15 @@
           onLineDoubleClick={handleLineDoubleClick}
           onSelectionRangeChange={handleSelectionRangeChange}
           onToggleStacktraceGroup={handleToggleStacktraceGroup}
+          onCopySelected={copySelectedLines}
           onUserScrollUp={pauseLive}
           onUserScrollBottom={resumeLive}
           onSelectionPause={pauseLive}
           onOpenLogLevels={() => (isLogLevelsModalOpen = true)}
+          onFilterInclude={handleFilterInclude}
+          onFilterExclude={handleFilterExclude}
+          onTimeDeltaChange={(delta) => (currentTimeDelta = delta)}
+          onToast={(msg) => showToast(msg)}
           onQuickMapLevel={(word, level) => {
             showToast(`Mappato "${word}" come ${level}`);
             if (activeQuickPreset === "errors" || activeQuickPreset === "warnings") {
@@ -1376,9 +1925,15 @@
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
           </div>
-          <p class="text-sm font-semibold text-white">Nessuna riga corrisponde al filtro</p>
+          <p class="text-sm font-semibold text-white">
+            {invert ? 'Tutte le righe contengono il pattern escluso' : 'Nessuna riga corrisponde al filtro'}
+          </p>
           <p class="text-xs text-[#B4BCD0] max-w-xs leading-relaxed">
-            Nessun risultato per <code class="text-indigo-200 font-mono bg-white/[0.06] px-1.5 py-0.5 rounded ring-1 ring-inset ring-white/[0.1]">{searchQuery}</code> ({searchTimeMs.toFixed(1)}ms).
+            {#if invert}
+              Nessuna riga priva di <code class="text-rose-200 font-mono bg-white/[0.06] px-1.5 py-0.5 rounded ring-1 ring-inset ring-white/[0.1]">{searchQuery}</code> ({searchTimeMs.toFixed(1)}ms).
+            {:else}
+              Nessun risultato per <code class="text-indigo-200 font-mono bg-white/[0.06] px-1.5 py-0.5 rounded ring-1 ring-inset ring-white/[0.1]">{searchQuery}</code> ({searchTimeMs.toFixed(1)}ms).
+            {/if}
           </p>
           <button
             onclick={clearSearch}
@@ -1537,15 +2092,15 @@
     />
   {/if}
 
-  <!-- Zona 3: Bottom Status Bar Minimalista (h-7 / 28px) - Visibile solo a file aperto -->
+  <!-- Zona 3: Bottom Status Bar Minimalista e Zen (h-7 / 28px) - Visibile solo a file aperto -->
   {#if activeTab}
     <footer class="h-7 px-3.5 bg-[#12151E] border-t border-white/[0.08] text-[11px] font-sans flex items-center justify-between text-[#B4BCD0] shrink-0 z-20">
-      <!-- Sinistra: LIVE / PAUSED + Conteggio righe -->
-      <div class="flex items-center gap-3 truncate">
+      <!-- Sinistra: LIVE/PAUSED + Metriche righe -->
+      <div class="flex items-center gap-2.5 truncate">
         {#if isLive}
           <button
             onclick={pauseLive}
-            class="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-300 ring-1 ring-inset ring-emerald-400/35 hover:bg-emerald-500/25 transition cursor-pointer font-semibold"
+            class="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-300 ring-1 ring-inset ring-emerald-400/35 hover:bg-emerald-500/25 transition cursor-pointer font-semibold text-[10.5px]"
             title="Metti in pausa lo streaming automatico (Space o scroll in su)"
           >
             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
@@ -1554,7 +2109,7 @@
         {:else}
           <button
             onclick={resumeLive}
-            class="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-300 ring-1 ring-inset ring-amber-400/35 hover:bg-amber-500/25 transition cursor-pointer font-semibold"
+            class="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-300 ring-1 ring-inset ring-amber-400/35 hover:bg-amber-500/25 transition cursor-pointer font-semibold text-[10.5px]"
             title="Riprendi lo streaming automatico (Space)"
           >
             <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
@@ -1565,45 +2120,72 @@
           </button>
         {/if}
 
-        <div class="flex items-center gap-2 text-[#B4BCD0]">
-          <span>
-            {effectiveTotalLines.toLocaleString()} {effectiveTotalLines === 1 ? 'riga' : 'righe'}
-          </span>
-          {#if isFilterActive}
-            <span class="text-indigo-300">
-              (filtrate su {totalLines.toLocaleString()})
-            </span>
-          {:else if displayTotalRows < totalLines}
-            <span class="text-purple-300">
-              ({(totalLines - displayTotalRows).toLocaleString()} compresse)
-            </span>
-          {/if}
+        <span class="text-white/20 select-none">·</span>
 
-          {#if selectedLineNumbers.size > 0}
-            <span class="ml-1 px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 ring-1 ring-inset ring-indigo-400/35 text-[10px] font-mono font-semibold">
-              {selectedLineNumbers.size.toLocaleString()} {selectedLineNumbers.size === 1 ? 'riga evidenziata' : 'righe evidenziate'}
+        <div class="flex items-center gap-1.5 text-[#B4BCD0]">
+          <span class="font-mono text-[#F4F6FB]">{effectiveTotalLines.toLocaleString()}</span>
+          <span>{effectiveTotalLines === 1 ? 'riga' : 'righe'}</span>
+
+          {#if isFilterActive}
+            <span class="text-indigo-300 font-mono">
+              ({totalMatches.toLocaleString()} / {totalLines.toLocaleString()})
+            </span>
+            {#if invert}
+              <span class="px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-300 ring-1 ring-inset ring-rose-400/35 text-[9px] font-mono font-semibold">
+                Esclusione
+              </span>
+            {/if}
+          {:else if displayTotalRows < totalLines}
+            <span class="text-purple-300 text-[10.5px]">
+              ({(totalLines - displayTotalRows).toLocaleString()} compresse)
             </span>
           {/if}
         </div>
       </div>
 
-      <!-- Destra: Indicatore colonne + Schede aperte + Vai alla fine -->
+      <!-- Centro: Badge Contestuali (Delta temporale o Selezione) -->
+      <div class="flex items-center gap-2">
+        {#if currentTimeDelta}
+          <button
+            onclick={async () => {
+              if (currentTimeDelta) {
+                try {
+                  await navigator.clipboard.writeText(currentTimeDelta.formatted);
+                  showToast(`Δt copiato: ${currentTimeDelta.formattedShort}`);
+                } catch {}
+              }
+            }}
+            class="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-200 ring-1 ring-inset ring-amber-400/40 hover:bg-amber-500/30 transition cursor-pointer font-mono text-[10.5px] font-semibold active:scale-95 shadow-xs"
+            title="Clicca per copiare il delta temporale negli appunti ({currentTimeDelta.formatted})"
+          >
+            <span>⏱️ Δt:</span>
+            <span class="text-white font-bold">{currentTimeDelta.formattedShort}</span>
+            <span class="text-[9.5px] text-amber-300/80">({currentTimeDelta.lineCount} righe)</span>
+          </button>
+        {/if}
+
+        {#if selectedLineNumbers.size > 0}
+          <span class="px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 ring-1 ring-inset ring-indigo-400/35 text-[10px] font-mono font-semibold">
+            {selectedLineNumbers.size.toLocaleString()} {selectedLineNumbers.size === 1 ? 'selezionata' : 'selezionate'}
+          </span>
+        {/if}
+      </div>
+
+      <!-- Destra: Schede aperte + Vai alla fine -->
       <div class="flex items-center gap-3 shrink-0">
         {#if tabs.length > 1}
           <span class="text-[10.5px] text-[#7E879B] font-mono">
             {tabs.length} schede
           </span>
         {/if}
-        <span class="hidden sm:inline text-[10.5px] text-[#7E879B]">
-          Colonne: Riga · Orario · Livello · Messaggio
-        </span>
         {#if !isAtBottom || !isLive}
           <button
             onclick={resumeLive}
-            class="text-indigo-300 hover:text-indigo-200 font-semibold transition cursor-pointer text-[11px]"
+            class="text-indigo-300 hover:text-indigo-200 font-semibold transition cursor-pointer text-[11px] flex items-center gap-1 hover:underline"
             title="Torna alla fine del file (Space)"
           >
-            Vai alla fine (Space)
+            <span>Vai alla fine (Space)</span>
+            <span>⇣</span>
           </button>
         {/if}
       </div>
@@ -1630,6 +2212,7 @@
     {searchMode}
     {isRegex}
     {caseSensitive}
+    {invert}
     {isDrawerOpen}
     foldingEnabled={foldingStatus.auto_collapse_enabled}
     {totalLines}
@@ -1644,6 +2227,7 @@
     isOpen={isLogLevelsModalOpen}
     onClose={() => {
       isLogLevelsModalOpen = false;
+      fetchHeatmap(activeTab);
       if (activeQuickPreset === "errors" || activeQuickPreset === "warnings") {
         scheduleSearch(true);
       }

@@ -10,6 +10,7 @@
     searchMode: SearchDisplayMode;
     isRegex: boolean;
     caseSensitive: boolean;
+    invert?: boolean;
     isDrawerOpen: boolean;
     foldingEnabled: boolean;
     totalLines: number;
@@ -28,6 +29,7 @@
     searchMode,
     isRegex,
     caseSensitive,
+    invert = false,
     isDrawerOpen,
     foldingEnabled,
     totalLines,
@@ -77,6 +79,22 @@
       category: "Navigation",
       shortcut: "↵",
       icon: "down"
+    },
+    {
+      id: "next_bookmark",
+      title: "Next Bookmark (Segnalibro successivo)",
+      subtitle: "Jump to the next bookmarked line",
+      category: "Navigation",
+      shortcut: "F2",
+      icon: "down"
+    },
+    {
+      id: "prev_bookmark",
+      title: "Previous Bookmark (Segnalibro precedente)",
+      subtitle: "Jump to the previous bookmarked line",
+      category: "Navigation",
+      shortcut: "⇧F2",
+      icon: "top"
     },
     {
       id: "prev_match",
@@ -148,6 +166,37 @@
       shortcut: "Alt+L",
       icon: "settings"
     },
+    {
+      id: "toggle_wrap",
+      title: "Toggle Word Wrap (A capo automatico)",
+      subtitle: "Alterna tra visualizzazione a capo e scorrimento orizzontale",
+      category: "Stream & View",
+      shortcut: "Alt+Z",
+      icon: "refresh"
+    },
+    {
+      id: "toggle_timeline",
+      title: "Toggle Timeline & Time Histogram (Timeline Temporale)",
+      subtitle: "Mostra o nasconde l'istogramma temporale con selezione ad area (brushing)",
+      category: "Stream & View",
+      shortcut: "Alt+T",
+      icon: "sparkles"
+    },
+    {
+      id: "toggle_bookmark",
+      title: "Toggle Bookmark on Line (Aggiungi/Rimuovi Segnalibro)",
+      subtitle: "Aggiunge o rimuove il segnalibro sulla riga selezionata",
+      category: "Stream & View",
+      shortcut: "Ctrl+B",
+      icon: "bookmark"
+    },
+    {
+      id: "clear_all_bookmarks",
+      title: "Clear All Bookmarks (Rimuovi tutti i segnalibri)",
+      subtitle: "Rimuove tutti i segnalibri impostati in questa scheda",
+      category: "Stream & View",
+      icon: "clear"
+    },
 
     // Search & Filter
     {
@@ -183,11 +232,57 @@
       icon: "case"
     },
     {
+      id: "toggle_invert",
+      title: invert ? "Invert Filter: Turn OFF (Show matching lines)" : "Invert Filter: Turn ON (Exclude matching lines)",
+      subtitle: "Mostra solo le righe che NON contengono la query",
+      category: "Search & Filter",
+      shortcut: "Alt+I",
+      icon: "filter"
+    },
+    {
       id: "clear_filter",
       title: "Clear Search Filter",
       subtitle: "Reset search query and display all rows",
       category: "Search & Filter",
       icon: "clear"
+    },
+    {
+      id: "export_filtered",
+      title: "Export Filtered Lines to File...",
+      subtitle: "Salva tutte le righe attualmente filtrate su disco",
+      category: "Search & Filter",
+      icon: "folder"
+    },
+    {
+      id: "copy_filtered",
+      title: "Copy All Filtered Lines to Clipboard",
+      subtitle: "Copia negli appunti fino a 5.000 righe filtrate",
+      category: "Search & Filter",
+      icon: "copy"
+    },
+    {
+      id: "copy_selected_lines",
+      title: "Copy Selected Lines to Clipboard",
+      subtitle: "Copia le righe selezionate negli appunti",
+      category: "Navigation",
+      shortcut: "⌘C",
+      icon: "copy"
+    },
+    {
+      id: "copy_selected_lines_with_numbers",
+      title: "Copy Selected Lines with Line Numbers",
+      subtitle: "Copia le righe selezionate includendo i numeri di riga",
+      category: "Navigation",
+      shortcut: "⌘⇧C",
+      icon: "copy"
+    },
+    {
+      id: "select_all_lines",
+      title: "Select All Lines",
+      subtitle: "Seleziona tutte le righe del documento",
+      category: "Navigation",
+      shortcut: "⌘A",
+      icon: "line"
     },
 
     // File Operations

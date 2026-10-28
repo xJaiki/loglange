@@ -98,6 +98,15 @@ impl SearchManager {
         guard.as_ref().map(|s| s.filtered_indices.len()).unwrap_or(0)
     }
 
+    /// Execute a closure borrowing the active filtered line indices without cloning.
+    pub fn with_filtered_indices<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&[u32]) -> R,
+    {
+        let guard = self.active_search.read();
+        guard.as_ref().map(|s| f(&s.filtered_indices))
+    }
+
     /// Execute search over the LogIndex in background parallel threads using SIMD.
     /// Can be cancelled at any time by calling `cancel_active()` or starting a new search.
     pub fn search(&self, index: &LogIndex, options: SearchOptions) -> Result<SearchResult, String> {
@@ -370,6 +379,65 @@ impl SearchManager {
             Some(*search.filtered_indices.last()? as usize + 1)
         }
     }
+
+    /// Export all matching filtered lines to a specified file path.
+    pub fn export_filtered_to_file(&self, index: &LogIndex, dest_path: &std::path::Path) -> Result<usize, String> {
+        use std::fs::File;
+        use std::io::{BufWriter, Write};
+
+        let guard = self.active_search.read();
+        let Some(search) = guard.as_ref() else {
+            return Err("No active search filter to export".to_string());
+        };
+
+        if search.filtered_indices.is_empty() {
+            return Ok(0);
+        }
+
+        let file = File::create(dest_path).map_err(|e| format!("Failed to create destination file: {}", e))?;
+        let mut writer = BufWriter::with_capacity(256 * 1024, file);
+
+        let mut count = 0;
+        for &line_idx in &search.filtered_indices {
+            if let Some(raw) = index.get_line_raw(line_idx as usize) {
+                writer.write_all(raw).map_err(|e| format!("Write error: {}", e))?;
+                if !raw.ends_with(b"\n") {
+                    writer.write_all(b"\n").map_err(|e| format!("Write error: {}", e))?;
+                }
+                count += 1;
+            }
+        }
+        writer.flush().map_err(|e| format!("Flush error: {}", e))?;
+        Ok(count)
+    }
+
+    /// Retrieve all filtered line contents as a single string (capped at max_lines for memory safety).
+    pub fn get_all_filtered_content(&self, index: &LogIndex, max_lines: usize) -> Result<String, String> {
+        let guard = self.active_search.read();
+        let Some(search) = guard.as_ref() else {
+            return Err("No active search filter".to_string());
+        };
+
+        let total = search.filtered_indices.len().min(max_lines);
+        let mut out = String::with_capacity(total * 100);
+
+        for i in 0..total {
+            let line_idx = search.filtered_indices[i] as usize;
+            if let Some(raw) = index.get_line_raw(line_idx) {
+                let mut content_slice = raw;
+                if content_slice.ends_with(b"\n") {
+                    content_slice = &content_slice[..content_slice.len() - 1];
+                }
+                if content_slice.ends_with(b"\r") {
+                    content_slice = &content_slice[..content_slice.len() - 1];
+                }
+                out.push_str(&String::from_utf8_lossy(content_slice));
+                out.push('\n');
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -621,5 +689,34 @@ mod tests {
         // Trigger cancellation in advance or immediately
         manager.cancel_active();
         assert!(!manager.has_active_search());
+    }
+
+    #[test]
+    fn test_export_filtered_to_file() {
+        let log = "line 1 error\nline 2 info\nline 3 error fatal\n";
+        let (_file, index) = create_test_file(log);
+
+        let manager = SearchManager::new();
+        manager
+            .search(
+                &index,
+                SearchOptions {
+                    query: "error".to_string(),
+                    is_regex: false,
+                    case_sensitive: false,
+                    invert: false,
+                },
+            )
+            .unwrap();
+
+        let dest = NamedTempFile::new().unwrap();
+        let exported_count = manager.export_filtered_to_file(&index, dest.path()).unwrap();
+        assert_eq!(exported_count, 2);
+
+        let content = std::fs::read_to_string(dest.path()).unwrap();
+        assert_eq!(content, "line 1 error\nline 3 error fatal\n");
+
+        let snippet = manager.get_all_filtered_content(&index, 10).unwrap();
+        assert_eq!(snippet, "line 1 error\nline 3 error fatal\n");
     }
 }

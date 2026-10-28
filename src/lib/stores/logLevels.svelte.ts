@@ -8,6 +8,7 @@ export interface LogLevelConfig {
   colorName: "rose" | "amber" | "sky" | "slate" | "purple";
   badgeClass: string;
   rowTintClass: string;
+  stripClass: string;
   textColor: string;
   keywords: string[];
 }
@@ -76,7 +77,8 @@ const DEFAULT_LEVEL_CONFIGS: Record<StandardLogLevel, LogLevelConfig> = {
     label: "Error",
     colorName: "rose",
     badgeClass: "bg-rose-500/20 text-rose-200 ring-1 ring-inset ring-rose-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]",
-    rowTintClass: "bg-rose-500/[0.055] hover:bg-rose-500/[0.11] border-l-2 border-rose-500/85",
+    rowTintClass: "bg-rose-500/[0.055] hover:bg-rose-500/[0.11]",
+    stripClass: "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.7)]",
     textColor: "text-rose-300",
     keywords: ["FATAL", "CRITICAL", "PANIC", "ERROR", "ERR"],
   },
@@ -85,7 +87,8 @@ const DEFAULT_LEVEL_CONFIGS: Record<StandardLogLevel, LogLevelConfig> = {
     label: "Warning",
     colorName: "amber",
     badgeClass: "bg-amber-500/20 text-amber-200 ring-1 ring-inset ring-amber-400/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)]",
-    rowTintClass: "bg-amber-500/[0.04] hover:bg-amber-500/[0.09] border-l-2 border-amber-400/80",
+    rowTintClass: "bg-amber-500/[0.04] hover:bg-amber-500/[0.09]",
+    stripClass: "bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.5)]",
     textColor: "text-amber-300",
     keywords: ["WARN", "WARNING", "ATTENZIONE", "AVVISO"],
   },
@@ -94,7 +97,8 @@ const DEFAULT_LEVEL_CONFIGS: Record<StandardLogLevel, LogLevelConfig> = {
     label: "Info",
     colorName: "sky",
     badgeClass: "bg-sky-500/18 text-sky-200 ring-1 ring-inset ring-sky-400/35 shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]",
-    rowTintClass: "hover:bg-white/[0.04] border-l-2 border-transparent",
+    rowTintClass: "hover:bg-white/[0.04]",
+    stripClass: "bg-sky-400/60",
     textColor: "text-sky-300",
     keywords: ["INFO", "NOTICE"],
   },
@@ -103,7 +107,8 @@ const DEFAULT_LEVEL_CONFIGS: Record<StandardLogLevel, LogLevelConfig> = {
     label: "Debug",
     colorName: "slate",
     badgeClass: "bg-slate-400/15 text-slate-200 ring-1 ring-inset ring-slate-400/30",
-    rowTintClass: "hover:bg-white/[0.04] border-l-2 border-transparent text-[#CBD5E1]",
+    rowTintClass: "hover:bg-white/[0.04] text-[#CBD5E1]",
+    stripClass: "bg-slate-500/40",
     textColor: "text-slate-300",
     keywords: ["DEBUG"],
   },
@@ -112,7 +117,8 @@ const DEFAULT_LEVEL_CONFIGS: Record<StandardLogLevel, LogLevelConfig> = {
     label: "Trace",
     colorName: "purple",
     badgeClass: "bg-purple-500/20 text-purple-200 ring-1 ring-inset ring-purple-400/35",
-    rowTintClass: "hover:bg-white/[0.04] border-l-2 border-transparent text-[#B4BCD0]",
+    rowTintClass: "hover:bg-white/[0.04] text-[#B4BCD0]",
+    stripClass: "bg-purple-400/45",
     textColor: "text-purple-300",
     keywords: ["TRACE", "VERBOSE"],
   },
@@ -238,6 +244,7 @@ class LogLevelsManager {
     level: StandardLogLevel | null;
     badgeClass: string;
     rowTintClass: string;
+    stripClass: string;
     textColor: string;
   } {
     const order: StandardLogLevel[] = ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
@@ -249,6 +256,7 @@ class LogLevelsManager {
           level: lvl,
           badgeClass: config.badgeClass,
           rowTintClass: config.rowTintClass,
+          stripClass: config.stripClass,
           textColor: config.textColor,
         };
       }
@@ -257,7 +265,8 @@ class LogLevelsManager {
     return {
       level: null,
       badgeClass: "",
-      rowTintClass: "hover:bg-white/[0.04] border-l-2 border-transparent",
+      rowTintClass: "hover:bg-white/[0.04]",
+      stripClass: "bg-transparent",
       textColor: "text-[#F4F6FB]",
     };
   }

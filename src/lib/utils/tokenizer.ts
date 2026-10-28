@@ -6,7 +6,8 @@ import { logLevelsManager } from "$lib/stores/logLevels.svelte";
 export interface ParsedLineInfo {
   level: LogLevel | null;
   levelBadgeClass: string;
-  rowTintClass: string;          // Classe CSS di sfondo/bordo per l'intera riga in base al livello
+  rowTintClass: string;          // Classe CSS di sfondo per l'intera riga in base al livello
+  stripClass: string;            // Bordo colorato sinistro (Severity Strip) per identificazione periferica istantanea
   extractedTimestamp: string | null; // Orario compatto es. "14:22:09.104" estratto da inizio riga
   fullTimestamp: string | null;      // Timestamp completo per l'attributo title=""
   hasJson: boolean;
@@ -27,6 +28,7 @@ export function detectLogLevel(text: string): {
   level: LogLevel | null;
   badgeClass: string;
   rowTintClass: string;
+  stripClass: string;
   textColor: string;
 } {
   return logLevelsManager.detectLevel(text);
@@ -76,7 +78,7 @@ export function tokenizeLogLine(
   }
 
   const isStacktrace = STACKTRACE_PREFIX_REGEX.test(content);
-  const { level, badgeClass, rowTintClass } = detectLogLevel(content);
+  const { level, badgeClass, rowTintClass, stripClass } = detectLogLevel(content);
 
   let workingContent = content;
   let extractedTimestamp: string | null = null;
@@ -215,6 +217,7 @@ export function tokenizeLogLine(
     level,
     levelBadgeClass: badgeClass,
     rowTintClass,
+    stripClass,
     extractedTimestamp,
     fullTimestamp,
     hasJson,

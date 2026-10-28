@@ -63,6 +63,57 @@ export interface ExtractedPayload {
   error?: string | null;
 }
 
+export interface TimeBucket {
+  start_time: number;
+  end_time: number;
+  label: string;
+  count: number;
+  error_count: number;
+  warn_count: number;
+  info_count: number;
+  start_line: number;
+  end_line: number;
+}
+
+export interface TimeHistogram {
+  buckets: TimeBucket[];
+  total_lines: number;
+  lines_with_timestamp: number;
+  min_time: number;
+  max_time: number;
+  min_time_str: string;
+  max_time_str: string;
+  has_timestamps: boolean;
+}
+
+export interface TimelineBrushRange {
+  startIndex: number;
+  endIndex: number;
+  startTime: number;
+  endTime: number;
+  startLine: number;
+  endLine: number;
+  totalCount: number;
+  errorCount: number;
+  warnCount: number;
+}
+
+export interface HeatmapBin {
+  error_count: number;
+  warn_count: number;
+  start_line: number;
+  end_line: number;
+}
+
+export interface SeverityHeatmap {
+  total_lines: number;
+  total_errors: number;
+  total_warnings: number;
+  max_errors_in_bin: number;
+  max_warnings_in_bin: number;
+  bins: HeatmapBin[];
+}
+
 export interface LogTab {
   id: string;
   path: string;
@@ -79,6 +130,7 @@ export interface LogTab {
   searchQuery: string;
   isRegex: boolean;
   caseSensitive: boolean;
+  invert: boolean;
   searchMode: SearchDisplayMode;
   totalMatches: number;
   searchTimeMs: number;
@@ -93,4 +145,11 @@ export interface LogTab {
   selectedLineNumbers: Set<number>;
   lastAnchorLineNum: number | null;
   lastScrollIndex?: number;
+  // P1 View & Investigation State
+  wrapLines: boolean;
+  bookmarks: number[];
+  // P2 Timeline & Temporal State
+  isTimelineOpen: boolean;
+  timelineHistogram: TimeHistogram | null;
+  heatmap?: SeverityHeatmap | null;
 }

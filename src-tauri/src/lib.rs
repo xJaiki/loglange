@@ -2,6 +2,7 @@ pub mod cli;
 pub mod folding;
 pub mod indexer;
 pub mod search;
+pub mod timeline;
 pub mod watcher;
 
 use folding::{FoldingManager, FoldingStatus};
@@ -331,6 +332,113 @@ fn map_line_to_display_row(
     })
 }
 
+#[tauri::command]
+fn export_filtered_lines(
+    tab_id: Option<String>,
+    dest_path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    state.get_tab(tab_id, |session| {
+        let guard = session.index.read();
+        session
+            .search_manager
+            .export_filtered_to_file(&guard, Path::new(&dest_path))
+    })
+}
+
+#[tauri::command]
+fn get_filtered_content(
+    tab_id: Option<String>,
+    max_lines: Option<usize>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    state.get_tab(tab_id, |session| {
+        let guard = session.index.read();
+        session
+            .search_manager
+            .get_all_filtered_content(&guard, max_lines.unwrap_or(10_000))
+    })
+}
+
+#[tauri::command]
+fn get_lines_content(
+    tab_id: Option<String>,
+    line_numbers: Vec<usize>,
+    with_line_numbers: Option<bool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    state.get_tab(tab_id, |session| {
+        let guard = session.index.read();
+        let with_num = with_line_numbers.unwrap_or(false);
+        // Safety cap: up to 50,000 lines
+        let capped: Vec<usize> = line_numbers.into_iter().take(50_000).collect();
+        let lines = guard.get_lines_by_numbers(&capped);
+
+        if with_num {
+            let mut output = String::with_capacity(lines.iter().map(|l| l.len() + 16).sum());
+            for (i, line) in lines.iter().enumerate() {
+                if let Some(&num) = capped.get(i) {
+                    output.push_str(&format!("{}: {}\n", num, line));
+                } else {
+                    output.push_str(line);
+                    output.push('\n');
+                }
+            }
+            if output.ends_with('\n') {
+                output.pop();
+            }
+            Ok(output)
+        } else {
+            Ok(lines.join("\n"))
+        }
+    })
+}
+
+#[tauri::command]
+fn get_time_histogram(
+    tab_id: Option<String>,
+    bucket_count: Option<usize>,
+    filtered: Option<bool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<timeline::TimeHistogram, String> {
+    state.get_tab(tab_id, |session| {
+        let index_guard = session.index.read();
+        let target_buckets = bucket_count.unwrap_or(75);
+
+        if filtered == Some(true) {
+            let hist = session.search_manager.with_filtered_indices(|indices| {
+                timeline::build_histogram(&index_guard, Some(indices), target_buckets)
+            });
+            match hist {
+                Some(h) => Ok(h),
+                None => Ok(timeline::build_histogram(&index_guard, None, target_buckets)),
+            }
+        } else {
+            Ok(timeline::build_histogram(&index_guard, None, target_buckets))
+        }
+    })
+}
+
+#[tauri::command]
+fn get_severity_heatmap(
+    tab_id: Option<String>,
+    num_bins: Option<usize>,
+    custom_error_keywords: Option<Vec<String>>,
+    custom_warn_keywords: Option<Vec<String>>,
+    state: tauri::State<'_, AppState>,
+) -> Result<timeline::SeverityHeatmap, String> {
+    state.get_tab(tab_id, |session| {
+        let index_guard = session.index.read();
+        let target_bins = num_bins.unwrap_or(250);
+        Ok(timeline::build_severity_heatmap(
+            &index_guard,
+            target_bins,
+            custom_error_keywords.as_deref(),
+            custom_warn_keywords.as_deref(),
+        ))
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -372,7 +480,12 @@ pub fn run() {
             clear_search,
             get_initial_file,
             find_timestamp_line,
-            map_line_to_display_row
+            map_line_to_display_row,
+            export_filtered_lines,
+            get_filtered_content,
+            get_lines_content,
+            get_time_histogram,
+            get_severity_heatmap
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
